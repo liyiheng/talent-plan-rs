@@ -1,3 +1,5 @@
+use kvs::{Error, KvStore, Result};
+use std::path::PathBuf;
 use structopt::StructOpt;
 
 #[derive(StructOpt, Debug)]
@@ -8,20 +10,30 @@ enum Commands {
     Rm { key: String },
 }
 
-fn main() {
+fn main() -> Result<()> {
+    let pb = PathBuf::from("./");
     let cmd = Commands::from_args();
+    let mut db = KvStore::open(pb)?;
     match cmd {
-        Commands::Set { key: _, value: _ } => {
-            eprintln!("unimplemented");
-            std::process::exit(1);
+        Commands::Set { key: k, value: v } => {
+            db.set(k, v)?;
         }
-        Commands::Get { key: _ } => {
-            eprintln!("unimplemented");
-            std::process::exit(1);
+        Commands::Get { key: k } => {
+            let v = db.get(k)?;
+            if let Some(v) = v {
+                println!("{}", v);
+            } else {
+                println!("Key not found");
+            }
         }
-        Commands::Rm { key: _ } => {
-            eprintln!("unimplemented");
-            std::process::exit(1);
+        Commands::Rm { key: k } => {
+            let result = db.remove(k);
+            if let Err(Error::KeyNotFound(_)) = result {
+                println!("Key not found");
+                std::process::exit(1);
+            }
+            result?;
         }
     }
+    Ok(())
 }
