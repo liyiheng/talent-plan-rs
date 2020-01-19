@@ -1,4 +1,4 @@
-//! kvs is a lib for in-memory kv storage
+//! kvs is a lib for key-value database
 #![deny(missing_docs)]
 use failure::Fail;
 use serde::{Deserialize, Serialize};
@@ -50,7 +50,7 @@ enum Command<'a> {
 /// KvStore provides all functions of this lib
 pub struct KvStore {
     log_count: usize,
-    cur_version: usize,
+    version: usize,
     data_dir: PathBuf,
     map: HashMap<String, u64>,
     reader: BufReader<File>,
@@ -71,7 +71,7 @@ impl KvStore {
             return Ok(());
         }
 
-        let mut dir = self.data_dir.as_path().to_owned();
+        let mut dir = self.data_dir.clone();
         dir.push("compacting.tmp");
         let tmp_path = dir.as_path();
         let mut tmp_file = open_file(tmp_path)?;
@@ -86,21 +86,20 @@ impl KvStore {
             cur += buf.len() as u64;
         }
         tmp_file.flush()?;
-        let mut data_dir = self.data_dir.as_path().to_owned();
-        let ver = self.cur_version + 1;
-        data_dir.push(ver.to_string());
+        let mut data_dir = self.data_dir.clone();
+        data_dir.push((self.version + 1).to_string());
         std::fs::rename(tmp_path, data_dir.as_path())?;
         let file = open_file(data_dir.as_path())?;
         let file2 = file.try_clone()?;
 
         self.log_count = new_map.len();
         self.map = new_map;
-        self.cur_version += 1;
+        self.version += 1;
         self.reader = BufReader::new(file);
         self.writer = BufWriter::new(file2);
 
         data_dir.pop();
-        data_dir.push((self.cur_version - 1).to_string());
+        data_dir.push((self.version - 1).to_string());
         let _ = std::fs::remove_file(data_dir.as_path());
         Ok(())
     }
@@ -135,7 +134,7 @@ impl KvStore {
 
         let mut store = KvStore {
             log_count: 0,
-            cur_version: version,
+            version: version,
             data_dir: pb,
             map: HashMap::default(),
             reader,
