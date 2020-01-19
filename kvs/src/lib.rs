@@ -3,10 +3,10 @@
 use failure::Fail;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::path::Path;
 use std::path::PathBuf;
-
 /// Result is an alias to simplify error-handling.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -41,46 +41,95 @@ impl From<serde_json::Error> for Error {
 /// or deserizlized from log data.
 /// Use JSON format here, for both readable and portable
 #[derive(Serialize, Deserialize)]
-enum Command {
+enum Command<'a> {
     Rm(String),
     Get(String),
-    Set(String, String),
+    Set(&'a str, &'a str),
 }
 
 /// KvStore provides all functions of this lib
 pub struct KvStore {
+    log_size: usize,
+    cur_version: usize,
+    data_dir: PathBuf,
     file: File,
     map: HashMap<String, u64>,
 }
 
-/// Create new KvStore with HashMap::default()
-impl Default for KvStore {
-    fn default() -> Self {
-        KvStore {
-            file: std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .read(true)
-                .open("/tmp/tmp-kvs.db")
-                .unwrap(),
-            map: HashMap::default(),
-        }
-    }
-}
-
 impl KvStore {
+    const MAX_REDUNDANT_RATE: usize = 2;
+    const MIN_LOG_SIZE: usize = 500;
+
+    /// Compact the log file if needed,
+    /// by creating a new one, then remove the older one
+    fn check_compact(&mut self) -> Result<()> {
+        let size = self.map.len();
+        let need_compact =
+            size >= Self::MIN_LOG_SIZE && (self.log_size / size) >= Self::MAX_REDUNDANT_RATE;
+        if !need_compact {
+            return Ok(());
+        }
+
+        let mut dir = self.data_dir.as_path().to_owned();
+        dir.push("compacting.tmp");
+        let tmp_path = dir.as_path();
+        let mut tmp_file = open_file(tmp_path)?;
+        let mut new_map = HashMap::with_capacity(self.map.len());
+        let mut cur = 0;
+        for (k, _) in self.map.iter() {
+            let v = self.get(k.to_string()).unwrap().unwrap();
+            let cmd = Command::Set(k, &v);
+            let mut dat = serde_json::to_vec(&cmd)?;
+            dat.push(b'\n');
+            tmp_file.write_all(&dat)?;
+            new_map.insert(k.to_owned(), cur);
+            cur += dat.len() as u64;
+        }
+        tmp_file.flush()?;
+        let mut data_dir = self.data_dir.as_path().to_owned();
+        let ver = self.cur_version + 1;
+        data_dir.push(ver.to_string());
+        std::fs::rename(tmp_path, data_dir.as_path())?;
+        let file = open_file(data_dir.as_path())?;
+
+        self.log_size = new_map.len();
+        self.file = file;
+        self.map = new_map;
+        self.cur_version += 1;
+
+        data_dir.pop();
+        data_dir.push((self.cur_version - 1).to_string());
+        let _ = std::fs::remove_file(data_dir.as_path());
+        Ok(())
+    }
+
     /// Open a db file
     pub fn open(path: impl Into<PathBuf>) -> Result<KvStore> {
         let mut pb: PathBuf = path.into();
-        pb.push("tmp-kvs.log");
-        let path = pb.as_path();
+        let mut versions: Vec<usize> = pb
+            .read_dir()?
+            .filter(|f| f.is_ok())
+            .map(|r| {
+                r.unwrap()
+                    .path()
+                    .file_name()
+                    .map(|s| s.to_string_lossy().parse::<usize>())
+            })
+            .filter(|v| v.is_some())
+            .map(|v| v.unwrap())
+            .filter(|v| v.is_ok())
+            .map(|v| v.unwrap())
+            .collect();
+        versions.sort();
+        let version = versions.pop().unwrap_or(0);
+        pb.push(version.to_string());
+        let file = open_file(pb.as_path())?;
+        pb.pop();
         let mut store = KvStore {
-            file: std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .read(true)
-                .open(path)
-                .unwrap(),
+            log_size: 0,
+            cur_version: version,
+            data_dir: pb,
+            file,
             map: HashMap::default(),
         };
         let len = store.file.metadata()?.len() as usize;
@@ -90,9 +139,10 @@ impl KvStore {
             let mut s = Vec::new();
             let cmd_size = buf.read_until(b'\n', &mut s)?;
             let cmd = serde_json::from_slice(&s)?;
+            store.log_size += 1;
             match cmd {
                 Command::Set(k, _) => {
-                    store.map.insert(k, cur as u64);
+                    store.map.insert(k.to_owned(), cur as u64);
                 }
                 Command::Rm(k) => {
                     store.map.remove(&k);
@@ -105,26 +155,19 @@ impl KvStore {
         Ok(store)
     }
 
-    /// Create a new KvStore
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Insert or update a K-V pair
     pub fn set(&mut self, key: String, value: String) -> Result<()> {
-        let cmd = Command::Set(key, value);
+        let cmd = Command::Set(&key, &value);
         let cur = self.file.metadata()?.len();
-        serde_json::to_writer(&self.file, &cmd)?;
-        self.file.write(&[b'\n'])?;
-        self.file.flush()?;
-        if let Command::Set(k, _) = cmd {
-            self.map.insert(k, cur);
-        }
+        self.append_log(&cmd)?;
+        self.map.insert(key, cur);
+        self.log_size += 1;
+        self.check_compact()?;
         Ok(())
     }
 
     /// Get value by a key
-    pub fn get(&mut self, key: String) -> Result<Option<String>> {
+    pub fn get(&self, key: String) -> Result<Option<String>> {
         if let Some(offset) = self.map.get(&key) {
             let mut reader = BufReader::new(&self.file);
             reader.seek(SeekFrom::Start(*offset))?;
@@ -132,7 +175,7 @@ impl KvStore {
             reader.read_until(b'\n', &mut buf)?;
             let cmd = serde_json::from_slice(&buf)?;
             if let Command::Set(_, v) = cmd {
-                return Ok(Some(v));
+                return Ok(Some(v.to_owned()));
             }
         }
         Ok(None)
@@ -144,12 +187,29 @@ impl KvStore {
             return Err(Error::KeyNotFound(key));
         }
         let cmd = Command::Rm(key);
-        serde_json::to_writer(&self.file, &cmd)?;
-        self.file.write(&[b'\n'])?;
-        self.file.flush()?;
+        self.append_log(&cmd)?;
+        self.log_size += 1;
         if let Command::Rm(k) = cmd {
             self.map.remove(&k);
         }
+        self.check_compact()?;
         Ok(())
     }
+
+    fn append_log(&mut self, cmd: &Command) -> Result<()> {
+        serde_json::to_writer(&self.file, cmd)?;
+        self.file.write_all(&[b'\n'])?;
+        self.file.flush()?;
+        Ok(())
+    }
+}
+
+#[inline]
+fn open_file<P: AsRef<Path>>(p: P) -> Result<File> {
+    OpenOptions::new()
+        .write(true)
+        .read(true)
+        .create(true)
+        .open(p)
+        .map_err(Error::from)
 }
