@@ -1,4 +1,4 @@
-use kvs::{Error, KvStore, Result};
+use kvs::{Error, KvStore, KvsEngine, Result};
 use std::path::PathBuf;
 use structopt::StructOpt;
 

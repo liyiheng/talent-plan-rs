@@ -2,13 +2,30 @@
 #![deny(missing_docs)]
 use failure::Fail;
 use serde::{Deserialize, Serialize};
+use sled;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+
+const ENGINE_KEY: &str = "ENGINE";
+const ENGINE_KVS: &str = "kvs";
+const ENGINE_SLED: &str = "sled";
 
 /// Result is an alias to simplify error-handling.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// KvsEngine is extracted for pluggable storage engines
+pub trait KvsEngine {
+    /// Get value from the engine by key
+    fn get(&mut self, key: String) -> Result<Option<String>>;
+
+    /// Insert or update a K-V pair
+    fn set(&mut self, key: String, value: String) -> Result<()>;
+
+    /// Remove a K-V pair from KvStore
+    fn remove(&mut self, key: String) -> Result<()>;
+}
 
 /// Error for kv operateions
 #[derive(Fail, Debug)]
@@ -22,11 +39,23 @@ pub enum Error {
     /// Errors from serde_json
     #[fail(display = "JSON err: {}", _0)]
     JsonErr(serde_json::Error),
+    /// Errors from sled
+    #[fail(display = "Sled err: {}", _0)]
+    SledErr(sled::Error),
+    /// Error used when engine dismatching db file
+    #[fail(display = "Wrong engine")]
+    WrongEngine,
 }
 
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Error {
         Error::IoErr(e)
+    }
+}
+
+impl From<sled::Error> for Error {
+    fn from(e: sled::Error) -> Error {
+        Error::SledErr(e)
     }
 }
 
@@ -41,10 +70,22 @@ impl From<serde_json::Error> for Error {
 /// or deserizlized from log data.
 /// Use JSON format here, for both human and machine friendly
 #[derive(Serialize, Deserialize)]
-enum Command<'a> {
+pub enum Command<'a> {
+    /// Remove a key
     Rm(&'a str),
+    /// Get value by key
     Get(&'a str),
+    /// Insert or update a K-V pair
     Set(&'a str, &'a str),
+}
+
+/// Response of a command
+#[derive(Deserialize, Serialize)]
+pub struct Response {
+    /// Value of a key
+    pub value: Option<String>,
+    /// Error message
+    pub error: Option<String>,
 }
 
 /// KvStore provides all functions of this lib
@@ -59,14 +100,12 @@ pub struct KvStore {
 
 impl KvStore {
     const MAX_REDUNDANT_RATE: usize = 2;
-    const MIN_LOG_SIZE: usize = 500;
 
     /// Compact the log file if needed,
     /// by creating a new one, then remove the older one
     fn check_compact(&mut self) -> Result<()> {
         let size = self.map.len();
-        let need_compact =
-            size >= Self::MIN_LOG_SIZE && (self.log_count / size) >= Self::MAX_REDUNDANT_RATE;
+        let need_compact = size > 0 && (self.log_count / size) >= Self::MAX_REDUNDANT_RATE;
         if !need_compact {
             return Ok(());
         }
@@ -107,6 +146,7 @@ impl KvStore {
     /// Open a db with specified path
     pub fn open(path: impl Into<PathBuf>) -> Result<KvStore> {
         let mut pb: PathBuf = path.into();
+        check_engine(pb.clone(), ENGINE_KVS)?;
         let mut versions: Vec<usize> = pb
             .read_dir()?
             .filter(|f| f.is_ok())
@@ -162,33 +202,17 @@ impl KvStore {
         Ok(store)
     }
 
-    /// Insert or update a K-V pair
-    pub fn set(&mut self, key: String, value: String) -> Result<()> {
-        let cmd = Command::Set(&key, &value);
-        let cur = self.writer.seek(SeekFrom::End(0))?;
-        self.append_log(&cmd)?;
-        self.map.insert(key, cur);
-        self.log_count += 1;
-        self.check_compact()?;
+    fn append_log(&mut self, cmd: &Command) -> Result<()> {
+        let mut dat = serde_json::to_vec(cmd)?;
+        dat.push(b'\n');
+        self.writer.write_all(&dat)?;
+        self.writer.flush()?;
         Ok(())
     }
+}
 
-    /// Get value by a key
-    pub fn get(&mut self, key: String) -> Result<Option<String>> {
-        if let Some(offset) = self.map.get(&key) {
-            self.reader.seek(SeekFrom::Start(*offset))?;
-            let mut buf = Vec::new();
-            self.reader.read_until(b'\n', &mut buf)?;
-            let cmd = serde_json::from_slice(&buf)?;
-            if let Command::Set(_, v) = cmd {
-                return Ok(Some(v.to_owned()));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Remove a K-V pair from KvStore
-    pub fn remove(&mut self, key: String) -> Result<()> {
+impl KvsEngine for KvStore {
+    fn remove(&mut self, key: String) -> Result<()> {
         if !self.map.contains_key(&key) {
             return Err(Error::KeyNotFound(key));
         }
@@ -200,12 +224,82 @@ impl KvStore {
         Ok(())
     }
 
-    fn append_log(&mut self, cmd: &Command) -> Result<()> {
-        let mut dat = serde_json::to_vec(cmd)?;
-        dat.push(b'\n');
-        self.writer.write_all(&dat)?;
-        self.writer.flush()?;
+    fn set(&mut self, key: String, value: String) -> Result<()> {
+        let cmd = Command::Set(&key, &value);
+        let cur = self.writer.seek(SeekFrom::End(0))?;
+        self.append_log(&cmd)?;
+        self.map.insert(key, cur);
+        self.log_count += 1;
+        self.check_compact()?;
         Ok(())
+    }
+
+    fn get(&mut self, key: String) -> Result<Option<String>> {
+        if let Some(offset) = self.map.get(&key) {
+            self.reader.seek(SeekFrom::Start(*offset))?;
+            let mut buf = Vec::new();
+            self.reader.read_until(b'\n', &mut buf)?;
+            let cmd = serde_json::from_slice(&buf)?;
+            if let Command::Set(_, v) = cmd {
+                return Ok(Some(v.to_owned()));
+            }
+        }
+        Ok(None)
+    }
+}
+/// Implementation of KvsEngine with sled
+pub struct SledKvsEngine(sled::Db);
+
+impl SledKvsEngine {
+    /// Open sled db
+    pub fn open(path: impl Into<PathBuf>) -> Result<SledKvsEngine> {
+        let pb: PathBuf = path.into();
+        check_engine(pb.clone(), ENGINE_SLED)?;
+        sled::open(pb)
+            .map(|db| SledKvsEngine(db))
+            .map_err(|e| Error::from(e))
+    }
+}
+fn check_engine(mut path: PathBuf, engine: &str) -> Result<()> {
+    path.push(ENGINE_KEY);
+    let mut f = open_file(path.as_path())?;
+    if f.metadata()?.len() == 0 {
+        f.write_all(engine.as_bytes())?;
+        return Ok(());
+    }
+
+    let mut cur = String::new();
+    f.read_to_string(&mut cur)?;
+    if &cur != engine {
+        return Err(Error::WrongEngine);
+    }
+    Ok(())
+}
+
+impl KvsEngine for SledKvsEngine {
+    fn get(&mut self, key: String) -> Result<Option<String>> {
+        self.0
+            .get(key)
+            .map(|v| v.map(|v| String::from_utf8_lossy(v.as_ref()).to_string()))
+            .map_err(|e| Error::from(e))
+    }
+    fn set(&mut self, key: String, value: String) -> Result<()> {
+        let result = self
+            .0
+            .insert(key, value.as_bytes())
+            .map(|_| ())
+            .map_err(|e| Error::from(e));
+        self.0.flush().map_err(Error::from)?;
+        result
+    }
+    fn remove(&mut self, key: String) -> Result<()> {
+        let result = match self.0.remove(&key) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(Error::KeyNotFound(key)),
+            Err(e) => Err(Error::from(e)),
+        };
+        self.0.flush().map_err(Error::from)?;
+        result
     }
 }
 
