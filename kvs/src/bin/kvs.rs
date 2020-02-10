@@ -13,7 +13,7 @@ enum Commands {
 fn main() -> Result<()> {
     let pb = PathBuf::from("./");
     let cmd = Commands::from_args();
-    let mut db = KvStore::open(pb)?;
+    let db = KvStore::open(pb)?;
     match cmd {
         Commands::Set { key: k, value: v } => {
             db.set(k, v)?;

@@ -8,6 +8,12 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+/// Provide thread pools
+pub mod thread_pool;
+
+/// Contains a server and a client
+pub mod app;
+
 const ENGINE_KEY: &str = "ENGINE";
 const ENGINE_KVS: &str = "kvs";
 const ENGINE_SLED: &str = "sled";
@@ -16,15 +22,15 @@ const ENGINE_SLED: &str = "sled";
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// KvsEngine is extracted for pluggable storage engines
-pub trait KvsEngine {
+pub trait KvsEngine: Clone + Send + 'static {
     /// Get value from the engine by key
-    fn get(&mut self, key: String) -> Result<Option<String>>;
+    fn get(&self, key: String) -> Result<Option<String>>;
 
     /// Insert or update a K-V pair
-    fn set(&mut self, key: String, value: String) -> Result<()>;
+    fn set(&self, key: String, value: String) -> Result<()>;
 
-    /// Remove a K-V pair from KvStore
-    fn remove(&mut self, key: String) -> Result<()>;
+    /// Remove a K-V pair from the engine
+    fn remove(&self, key: String) -> Result<()>;
 }
 
 /// Error for kv operateions
@@ -45,6 +51,9 @@ pub enum Error {
     /// Error used when engine dismatching db file
     #[fail(display = "Wrong engine")]
     WrongEngine,
+    /// Error from rayon
+    #[fail(display = "Rayon: {}", _0)]
+    Rayon(rayon::ThreadPoolBuildError),
 }
 
 impl From<std::io::Error> for Error {
@@ -79,17 +88,26 @@ pub enum Command<'a> {
     Set(&'a str, &'a str),
 }
 
-/// Response of a command
-#[derive(Deserialize, Serialize)]
-pub struct Response {
-    /// Value of a key
-    pub value: Option<String>,
-    /// Error message
-    pub error: Option<String>,
-}
+use std::sync::Arc;
+use std::sync::Mutex;
 
 /// KvStore provides all functions of this lib
+#[derive(Clone)]
 pub struct KvStore {
+    inner: Arc<Mutex<KvStoreInner>>,
+}
+
+impl KvStore {
+    /// Open a db with specified path
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
+        let inner = KvStoreInner::open(path)?;
+        Ok(KvStore {
+            inner: Arc::new(Mutex::new(inner)),
+        })
+    }
+}
+
+struct KvStoreInner {
     log_count: usize,
     version: usize,
     data_dir: PathBuf,
@@ -98,7 +116,7 @@ pub struct KvStore {
     writer: BufWriter<File>,
 }
 
-impl KvStore {
+impl KvStoreInner {
     const MAX_REDUNDANT_RATE: usize = 2;
 
     /// Compact the log file if needed,
@@ -143,8 +161,7 @@ impl KvStore {
         Ok(())
     }
 
-    /// Open a db with specified path
-    pub fn open(path: impl Into<PathBuf>) -> Result<KvStore> {
+    fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let mut pb: PathBuf = path.into();
         check_engine(pb.clone(), ENGINE_KVS)?;
         let mut versions: Vec<usize> = pb
@@ -172,9 +189,9 @@ impl KvStore {
         let reader = BufReader::new(f1);
         let writer = BufWriter::new(f2);
 
-        let mut store = KvStore {
+        let mut store = KvStoreInner {
             log_count: 0,
-            version: version,
+            version,
             data_dir: pb,
             map: HashMap::default(),
             reader,
@@ -212,33 +229,37 @@ impl KvStore {
 }
 
 impl KvsEngine for KvStore {
-    fn remove(&mut self, key: String) -> Result<()> {
-        if !self.map.contains_key(&key) {
+    fn remove(&self, key: String) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.map.contains_key(&key) {
             return Err(Error::KeyNotFound(key));
         }
         let cmd = Command::Rm(&key);
-        self.append_log(&cmd)?;
-        self.log_count += 1;
-        self.map.remove(&key);
-        self.check_compact()?;
+        inner.append_log(&cmd)?;
+        inner.log_count += 1;
+        inner.map.remove(&key);
+        inner.check_compact()?;
         Ok(())
     }
 
-    fn set(&mut self, key: String, value: String) -> Result<()> {
+    fn set(&self, key: String, value: String) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
         let cmd = Command::Set(&key, &value);
-        let cur = self.writer.seek(SeekFrom::End(0))?;
-        self.append_log(&cmd)?;
-        self.map.insert(key, cur);
-        self.log_count += 1;
-        self.check_compact()?;
+        let cur = inner.writer.seek(SeekFrom::End(0))?;
+        inner.append_log(&cmd)?;
+        inner.map.insert(key, cur);
+        inner.log_count += 1;
+        inner.check_compact()?;
         Ok(())
     }
 
-    fn get(&mut self, key: String) -> Result<Option<String>> {
-        if let Some(offset) = self.map.get(&key) {
-            self.reader.seek(SeekFrom::Start(*offset))?;
+    fn get(&self, key: String) -> Result<Option<String>> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(offset) = inner.map.get(&key) {
+            let offset = *offset;
+            inner.reader.seek(SeekFrom::Start(offset))?;
             let mut buf = Vec::new();
-            self.reader.read_until(b'\n', &mut buf)?;
+            inner.reader.read_until(b'\n', &mut buf)?;
             let cmd = serde_json::from_slice(&buf)?;
             if let Command::Set(_, v) = cmd {
                 return Ok(Some(v.to_owned()));
@@ -247,7 +268,9 @@ impl KvsEngine for KvStore {
         Ok(None)
     }
 }
+
 /// Implementation of KvsEngine with sled
+#[derive(Clone)]
 pub struct SledKvsEngine(sled::Db);
 
 impl SledKvsEngine {
@@ -277,13 +300,13 @@ fn check_engine(mut path: PathBuf, engine: &str) -> Result<()> {
 }
 
 impl KvsEngine for SledKvsEngine {
-    fn get(&mut self, key: String) -> Result<Option<String>> {
+    fn get(&self, key: String) -> Result<Option<String>> {
         self.0
             .get(key)
             .map(|v| v.map(|v| String::from_utf8_lossy(v.as_ref()).to_string()))
             .map_err(|e| Error::from(e))
     }
-    fn set(&mut self, key: String, value: String) -> Result<()> {
+    fn set(&self, key: String, value: String) -> Result<()> {
         let result = self
             .0
             .insert(key, value.as_bytes())
@@ -292,7 +315,7 @@ impl KvsEngine for SledKvsEngine {
         self.0.flush().map_err(Error::from)?;
         result
     }
-    fn remove(&mut self, key: String) -> Result<()> {
+    fn remove(&self, key: String) -> Result<()> {
         let result = match self.0.remove(&key) {
             Ok(Some(_)) => Ok(()),
             Ok(None) => Err(Error::KeyNotFound(key)),
