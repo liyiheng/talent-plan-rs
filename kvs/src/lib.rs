@@ -4,11 +4,11 @@ use chashmap::CHashMap;
 use crossbeam_epoch::{self as epoch, Atomic, Owned};
 use failure::Fail;
 use serde::{Deserialize, Serialize};
-use sled;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{atomic::Ordering, Arc, Mutex};
+use std::sync::{atomic::Ordering, Arc, Mutex, MutexGuard};
+use std::thread::ThreadId;
 
 /// Provide thread pools
 pub mod thread_pool;
@@ -93,7 +93,7 @@ pub enum Command<'a> {
 /// KvStore provides all functions of this lib
 #[derive(Clone)]
 pub struct KvStore {
-    inner: Arc<Mutex<KvStoreInner>>,
+    inner: Arc<KvStoreInner>,
 }
 
 impl KvStore {
@@ -101,7 +101,7 @@ impl KvStore {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let inner = KvStoreInner::open(path)?;
         Ok(KvStore {
-            inner: Arc::new(Mutex::new(inner)),
+            inner: Arc::new(inner),
         })
     }
 }
@@ -110,9 +110,9 @@ struct KvStoreInner {
     log_count: Atomic<usize>,
     version: Atomic<usize>,
     data_dir: Arc<PathBuf>,
-    index: CHashMap<String, u64>,
-    reader: BufReader<File>,
-    writer: Mutex<BufWriter<File>>,
+    index: Atomic<CHashMap<String, u64>>,
+    readers: Atomic<CHashMap<ThreadId, BufReader<File>>>,
+    writer: Atomic<Mutex<BufWriter<File>>>,
 }
 
 impl KvStoreInner {
@@ -120,9 +120,9 @@ impl KvStoreInner {
 
     /// Compact the log file if needed,
     /// by creating a new one, then remove the older one
-    fn check_compact(&mut self) -> Result<()> {
+    fn check_compact(&self) -> Result<()> {
         let guard = epoch::pin();
-        let size = self.index.len();
+        let size = unsafe { self.index.load(Ordering::Acquire, &guard).deref().len() };
         let log_count = unsafe { self.log_count.load(Ordering::Acquire, &guard).deref() };
         let need_compact = size > 0 && (log_count / size) >= Self::MAX_REDUNDANT_RATE;
         if !need_compact {
@@ -132,13 +132,27 @@ impl KvStoreInner {
         dir.push("compacting.tmp");
         let tmp_path = dir.as_path();
         let mut tmp_file = open_file(tmp_path)?;
-        let new_map = CHashMap::with_capacity(self.index.len());
+        let new_map = CHashMap::with_capacity(size);
+        let mut reader = {
+            let tid = std::thread::current().id();
+            let readers = unsafe { self.readers.load(Ordering::Acquire, &guard).deref() };
+            if !readers.contains_key(&tid) {
+                let ver = unsafe { self.version.load(Ordering::Acquire, &guard).deref() };
+                let mut path = self.data_dir.as_ref().clone();
+                path.push(ver.to_string());
+                let file = File::open(path.as_path())?;
+                let reader = BufReader::new(file);
+                readers.insert(tid, reader);
+            }
+            readers.get_mut(&tid).unwrap()
+        };
+        let old_index = unsafe { self.index.load(Ordering::Acquire, &guard).deref().clone() };
         let mut cur = 0;
-        let old_index = self.index.clone();
         for (k, v) in old_index.into_iter() {
-            self.reader.seek(SeekFrom::Start(v))?;
+            reader.seek(SeekFrom::Start(v))?;
             let mut buf = Vec::new();
-            self.reader.read_until(b'\n', &mut buf)?;
+            reader.read_until(b'\n', &mut buf)?;
+            tmp_file.seek(SeekFrom::End(0))?;
             tmp_file.write_all(&buf)?;
             new_map.insert(k.to_owned(), cur);
             cur += buf.len() as u64;
@@ -150,14 +164,19 @@ impl KvStoreInner {
         data_dir.push(new_version.to_string());
         std::fs::rename(tmp_path, data_dir.as_path())?;
         let file = open_file(data_dir.as_path())?;
-        let file2 = file.try_clone()?;
 
         self.log_count
             .store(Owned::new(new_map.len()), Ordering::Release);
+        self.writer.store(
+            Owned::new(Mutex::new(BufWriter::new(file))),
+            Ordering::Release,
+        );
+
         *version += 1;
-        self.index = new_map;
-        self.reader = BufReader::new(file);
-        self.writer = Mutex::new(BufWriter::new(file2));
+        self.index.store(Owned::new(new_map), Ordering::Release);
+        // self.cur_file.store(Owned::new(file), Ordering::Release);
+        self.readers
+            .store(Owned::new(CHashMap::new()), Ordering::Release);
 
         data_dir.pop();
         data_dir.push((new_version - 1).to_string());
@@ -185,91 +204,139 @@ impl KvStoreInner {
         versions.sort();
         let version = versions.pop().unwrap_or(0);
         pb.push(version.to_string());
-        let file = open_file(pb.as_path())?;
+        let f1 = open_file(pb.as_path())?;
         pb.pop();
-        let f1 = file.try_clone()?;
-        let f2 = file.try_clone()?;
+        let mut f2 = f1.try_clone()?;
         let len = f1.metadata()?.len() as usize;
-        let reader = BufReader::new(f1);
-        let writer = Mutex::new(BufWriter::new(f2));
+        let mut reader = BufReader::new(f1);
         let version = Atomic::new(version);
-        let mut store = KvStoreInner {
-            log_count: Atomic::new(0),
-            version,
-            data_dir: Arc::new(pb),
-            index: CHashMap::new(),
-            reader,
-            writer,
-        };
-
         let mut cur = 0;
         let mut log_cnt = 0;
+        let index = CHashMap::new();
         while cur < len {
             let mut s = Vec::new();
-            let cmd_size = store.reader.read_until(b'\n', &mut s)?;
+            let cmd_size = reader.read_until(b'\n', &mut s)?;
             let cmd = serde_json::from_slice(&s)?;
             match cmd {
                 Command::Set(k, _) => {
-                    store.index.insert(k.to_owned(), cur as u64);
+                    index.insert(k.to_owned(), cur as u64);
                 }
                 Command::Rm(k) => {
-                    store.index.remove(k);
+                    index.remove(k);
                 }
                 _ => {}
             }
             cur += cmd_size;
             log_cnt += 1;
         }
-        store.log_count.store(Owned::new(log_cnt), Ordering::SeqCst);
+        f2.seek(SeekFrom::End(0))?;
+        let writer = Atomic::new(Mutex::new(BufWriter::new(f2)));
+        let store = KvStoreInner {
+            log_count: Atomic::new(log_cnt),
+            version,
+            data_dir: Arc::new(pb),
+            index: Atomic::new(index),
+            readers: Atomic::new(CHashMap::new()),
+            writer,
+        };
         Ok(store)
     }
 
-    fn append_log(&mut self, cmd: &Command) -> Result<()> {
+    fn append_log(&self, cmd: &Command, mutex: &mut MutexGuard<'_, BufWriter<File>>) -> Result<()> {
         let mut dat = serde_json::to_vec(cmd)?;
         dat.push(b'\n');
-        let mut w = self.writer.lock().unwrap();
-        w.write_all(&dat)?;
-        w.flush()?;
+        mutex.seek(SeekFrom::End(0))?;
+        mutex.write_all(&dat)?;
+        mutex.flush()?;
         Ok(())
     }
 }
 
 impl KvsEngine for KvStore {
     fn remove(&self, key: String) -> Result<()> {
-        let mut inner = self.inner.lock().unwrap();
-        if !inner.index.contains_key(&key) {
+        let guard = epoch::pin();
+        let index = unsafe { self.inner.index.load(Ordering::Acquire, &guard).deref() };
+        if !index.contains_key(&key) {
             return Err(Error::KeyNotFound(key));
         }
+        let mut mutex_guard = unsafe {
+            self.inner
+                .writer
+                .load(Ordering::Acquire, &guard)
+                .deref()
+                .lock()
+                .unwrap()
+        };
         let cmd = Command::Rm(&key);
-        inner.append_log(&cmd)?;
-        let guard = epoch::pin();
-        let v = unsafe { inner.log_count.load(Ordering::Acquire, &guard).deref_mut() };
+        self.inner.append_log(&cmd, &mut mutex_guard)?;
+        let v = unsafe {
+            self.inner
+                .log_count
+                .load(Ordering::Acquire, &guard)
+                .deref_mut()
+        };
         *v += 1;
-        inner.index.remove(&key);
-        inner.check_compact()?;
+        index.remove(&key);
+        self.inner.check_compact()?;
         Ok(())
     }
 
     fn set(&self, key: String, value: String) -> Result<()> {
-        let mut inner = self.inner.lock().unwrap();
         let cmd = Command::Set(&key, &value);
-        let cur = inner.writer.lock().unwrap().seek(SeekFrom::End(0))?;
-        inner.append_log(&cmd)?;
-        inner.index.insert(key, cur);
         let guard = epoch::pin();
-        let v = unsafe { inner.log_count.load(Ordering::Acquire, &guard).deref_mut() };
-        *v += 1;
-        inner.check_compact()?;
+        let mut mutex_guard = unsafe {
+            self.inner
+                .writer
+                .load(Ordering::Acquire, &guard)
+                .deref()
+                .lock()
+                .unwrap()
+        };
+        let cur = mutex_guard.get_ref().metadata()?.len();
+        self.inner.append_log(&cmd, &mut mutex_guard)?;
+        unsafe {
+            self.inner
+                .index
+                .load(Ordering::Acquire, &guard)
+                .deref()
+                .insert(key, cur);
+        }
+        unsafe {
+            *self
+                .inner
+                .log_count
+                .load(Ordering::Acquire, &guard)
+                .deref_mut() += 1;
+        }
+        self.inner.check_compact()?;
         Ok(())
     }
 
     fn get(&self, key: String) -> Result<Option<String>> {
-        let mut inner = self.inner.lock().unwrap();
-        let position = inner.index.get(&key).map(|v| *v);
+        let tid = std::thread::current().id();
+        let guard = epoch::pin();
+        let position = unsafe {
+            self.inner
+                .index
+                .load(Ordering::Acquire, &guard)
+                .deref()
+                .get(&key)
+                .map(|v| *v)
+        };
+        let readers = unsafe { self.inner.readers.load(Ordering::Acquire, &guard).deref() };
+        if !readers.contains_key(&tid) {
+            let ver = unsafe { self.inner.version.load(Ordering::Acquire, &guard).deref() };
+            let mut path = self.inner.data_dir.as_ref().clone();
+            path.push(ver.to_string());
+            let file = File::open(path.as_path())?;
+            let reader = BufReader::new(file);
+            readers.insert(tid, reader);
+        }
+        let mut reader = readers.get_mut(&tid).unwrap();
         if let Some(offset) = position {
-            inner.reader.seek(SeekFrom::Start(offset))?;
+            reader.seek(SeekFrom::Start(offset))?;
             let mut buf = Vec::new();
-            inner.reader.read_until(b'\n', &mut buf)?;
+            reader.read_until(b'\n', &mut buf)?;
             let cmd = serde_json::from_slice(&buf)?;
             if let Command::Set(_, v) = cmd {
                 return Ok(Some(v.to_owned()));

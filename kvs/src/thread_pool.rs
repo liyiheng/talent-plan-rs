@@ -1,5 +1,4 @@
 use super::Result;
-use rayon;
 use std::panic::AssertUnwindSafe;
 use std::sync::{mpsc::Sender, Arc, Mutex};
 use std::thread::JoinHandle;
