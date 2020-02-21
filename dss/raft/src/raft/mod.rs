@@ -1,5 +1,6 @@
 use rand::Rng;
 use std::sync::mpsc::{sync_channel, Receiver};
+use std::sync::MutexGuard;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
@@ -230,8 +231,55 @@ pub struct Node {
     // Your code here.
     raft: Arc<Mutex<Raft>>, // TODO tmp code
 }
-use std::sync::MutexGuard;
+
 impl Node {
+    fn start_election(rf: Arc<Mutex<Raft>>) {
+        let receivers = {
+            let mut raft = rf.lock().unwrap();
+            raft.state = Arc::new(State {
+                term: raft.state.term + 1,
+                is_leader: false,
+            });
+            raft.voted_for = Some(raft.me as u64);
+            let args = RequestVoteArgs {
+                candidate_id: raft.me as u64,
+                last_log_index: raft.last_log_index,
+                last_log_term: raft.state.term,
+                term: raft.state.term,
+            };
+            let mut receivers = Vec::with_capacity(raft.peers.len());
+            for i in 0..raft.peers.len() {
+                if i == raft.me {
+                    continue;
+                }
+                let receiver = raft.send_request_vote(i, &args);
+                receivers.push(receiver);
+            }
+            receivers
+        };
+        let mut votes = 1;
+        // TODO Join receivers ?
+        let rpc_timeout = Duration::from_millis(200);
+        std::thread::sleep(rpc_timeout);
+        for rx in receivers.into_iter() {
+            if let Ok(Ok(reply)) = rx.try_recv() {
+                if reply.vote_granted {
+                    votes += 1;
+                }
+            }
+        }
+        let mut raft = rf.lock().unwrap();
+        let is_leader = votes > raft.peers.len() / 2;
+        raft.state = Arc::new(State {
+            term: raft.state.term,
+            is_leader,
+        });
+        raft.voted_for = None;
+        if is_leader {
+            Self::send_heartbeat(raft);
+        }
+    }
+
     fn send_heartbeat(mut guard: MutexGuard<'_, Raft>) {
         let args = AppendEntriesArgs {
             leader_id: guard.me as u64,
@@ -247,7 +295,6 @@ impl Node {
                 guard.last_heartbeat = Instant::now();
                 continue;
             }
-            //raft.peers.get(i).unwrap().append_entries(&args);
             let peer = guard.peers.get(i).unwrap();
             peer.spawn(
                 peer.append_entries(&args)
@@ -256,6 +303,7 @@ impl Node {
             );
         }
     }
+
     /// Create a new raft service.
     pub fn new(raft: Raft) -> Node {
         let raft = Arc::new(Mutex::new(raft));
@@ -265,57 +313,13 @@ impl Node {
             if rf.lock().unwrap().state.is_leader() {
                 let raft = rf.lock().unwrap();
                 Self::send_heartbeat(raft);
-                continue;
-            }
-            // Since the tester limits the frequency of RPC calls,
-            // election timeout is larger than 150ms-300ms in section5.2,
-            let millis = rand::thread_rng().gen_range(1000, 4000);
-            if rf.lock().unwrap().last_heartbeat.elapsed() > Duration::from_millis(millis) {
-                // election
-                let receivers = {
-                    let mut raft = rf.lock().unwrap();
-                    raft.state = Arc::new(State {
-                        term: raft.state.term + 1,
-                        is_leader: false,
-                    });
-                    raft.voted_for = Some(raft.me as u64);
-                    raft.voted_for = Some(raft.me as u64);
-                    let args = RequestVoteArgs {
-                        candidate_id: raft.me as u64,
-                        last_log_index: raft.last_log_index,
-                        last_log_term: raft.state.term,
-                        term: raft.state.term,
-                    };
-                    let mut receivers = Vec::with_capacity(raft.peers.len());
-                    for i in 0..raft.peers.len() {
-                        if i == raft.me {
-                            continue;
-                        }
-                        let receiver = raft.send_request_vote(i, &args);
-                        receivers.push(receiver);
-                    }
-                    receivers
-                };
-                let mut votes = 1;
-                // TODO sleep
-                let rpc_timeout = Duration::from_millis(200);
-                std::thread::sleep(rpc_timeout);
-                for rx in receivers.into_iter() {
-                    if let Ok(Ok(reply)) = rx.try_recv() {
-                        if reply.vote_granted {
-                            votes += 1;
-                        }
-                    }
-                }
-                let mut raft = rf.lock().unwrap();
-                let is_leader = votes > raft.peers.len() / 2;
-                raft.state = Arc::new(State {
-                    term: raft.state.term,
-                    is_leader,
-                });
-                raft.voted_for = None;
-                if is_leader {
-                    Self::send_heartbeat(raft);
+            } else {
+                // Since the tester limits the frequency of RPC calls,
+                // election timeout is larger than 150ms-300ms in section5.2,
+                let millis = rand::thread_rng().gen_range(1000, 4000);
+                let election_timeout = Duration::from_millis(millis);
+                if rf.lock().unwrap().last_heartbeat.elapsed() > election_timeout {
+                    Self::start_election(rf.clone());
                 }
             }
         });
