@@ -8,6 +8,8 @@ use std::time::Instant;
 use futures::future;
 use futures::sync::mpsc::UnboundedSender;
 use futures::Future;
+use futures::Stream;
+use futures_timer::Interval;
 use labrpc::RpcFuture;
 
 #[cfg(test)]
@@ -150,21 +152,6 @@ impl Raft {
         server: usize,
         args: &RequestVoteArgs,
     ) -> Receiver<Result<RequestVoteReply>> {
-        // Your code here if you want the rpc becomes async.
-        // Example:
-        // ```
-        // let peer = &self.peers[server];
-        // let (tx, rx) = channel();
-        // peer.spawn(
-        //     peer.request_vote(&args)
-        //         .map_err(Error::Rpc)
-        //         .then(move |res| {
-        //             tx.send(res);
-        //             Ok(())
-        //         }),
-        // );
-        // rx
-        // ```
         let (tx, rx) = sync_channel::<Result<RequestVoteReply>>(1);
         let peer = &self.peers[server];
         peer.spawn(
@@ -183,18 +170,16 @@ impl Raft {
     where
         M: labcodec::Message,
     {
+        if !self.state.is_leader() {
+            return Err(Error::NotLeader);
+        }
         let index = 0;
         let term = 0;
-        let is_leader = true;
         let mut buf = vec![];
         labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
         // Your code here (2B).
 
-        if is_leader {
-            Ok((index, term))
-        } else {
-            Err(Error::NotLeader)
-        }
+        Ok((index, term))
     }
 }
 
@@ -308,20 +293,25 @@ impl Node {
     pub fn new(raft: Raft) -> Node {
         let raft = Arc::new(Mutex::new(raft));
         let rf = raft.clone();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_millis(200));
-            if rf.lock().unwrap().state.is_leader() {
-                let raft = rf.lock().unwrap();
-                Self::send_heartbeat(raft);
-            } else {
-                // Since the tester limits the frequency of RPC calls,
-                // election timeout is larger than 150ms-300ms in section5.2,
-                let millis = rand::thread_rng().gen_range(1000, 4000);
-                let election_timeout = Duration::from_millis(millis);
-                if rf.lock().unwrap().last_heartbeat.elapsed() > election_timeout {
-                    Self::start_election(rf.clone());
-                }
-            }
+        std::thread::spawn(move || {
+            Interval::new(Duration::from_millis(200))
+                .for_each(|_| {
+                    if rf.lock().unwrap().state.is_leader() {
+                        let raft = rf.lock().unwrap();
+                        Self::send_heartbeat(raft);
+                    } else {
+                        // Since the tester limits the frequency of RPC calls,
+                        // election timeout is larger than 150ms-300ms in section5.2,
+                        let millis = rand::thread_rng().gen_range(1000, 4000);
+                        let election_timeout = Duration::from_millis(millis);
+                        if rf.lock().unwrap().last_heartbeat.elapsed() > election_timeout {
+                            Self::start_election(rf.clone());
+                        }
+                    }
+                    Ok(())
+                })
+                .wait()
+                .unwrap();
         });
         Node { raft }
     }
