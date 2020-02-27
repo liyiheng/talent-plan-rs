@@ -277,6 +277,7 @@ impl Raft {
                             continue;
                         }
                         let reply = reply.unwrap();
+                        // TODO move to append_entries_to
                         let _ = event_sender.unbounded_send(Event::AppendEntriesResult(
                             i,
                             index,
@@ -369,12 +370,22 @@ impl Raft {
         self.last_heartbeat = Instant::now();
         resp
     }
+
     fn update_state(&mut self, is_leader: bool, term: u64) {
         let t = self.state.term;
         if t > term {
             error!("TERM OF {} DECREASED FROM {} TO {}", self.me, t, term);
         }
         self.state = Arc::new(State { is_leader, term });
+    }
+
+    // index starts from 1
+    fn get_log(&self, index: usize) -> Option<&LogEntry> {
+        if index == 0 {
+            None
+        } else {
+            self.persistent_state.log.get(index - 1)
+        }
     }
 
     fn handle_vote_request(&mut self, args: RequestVoteArgs) -> RequestVoteReply {
@@ -489,12 +500,7 @@ impl Raft {
             entries.extend(src.iter().cloned());
             entries
         };
-        let prev_term = self
-            .persistent_state
-            .log
-            .get(i_next - 1)
-            .map(|l| l.term)
-            .unwrap_or(0);
+        let prev_term = self.get_log(i_next - 1).map(|l| l.term).unwrap_or(0);
         let args = AppendEntriesArgs {
             entries,
             leader_commit: self.commit_index as u64,
@@ -507,6 +513,7 @@ impl Raft {
             peer.append_entries(&args)
                 .map_err(Error::Rpc)
                 .then(move |reply| {
+                    info!("Result from {}, {:?}", i, reply);
                     let _ = sender.send((i, reply));
                     Ok(())
                 })
@@ -692,6 +699,7 @@ impl Node {
                                 let mut rf = raft.lock().unwrap();
                                 if reply.success {
                                     rf.leader_state.match_index[peer] = index;
+                                    rf.leader_state.next_index[peer] = index + 1;
                                 } else if reply.term > rf.state.term {
                                     rf.update_state(false, reply.term);
                                     warn!(
@@ -699,8 +707,8 @@ impl Node {
                                         rf.me, rf.state.is_leader
                                     );
                                 } else if rf.leader_state.next_index[peer] > 1 {
-                                    // TODO retry
                                     rf.leader_state.next_index[peer] -= 1;
+                                    let _ = rf.append_entries_to(peer);
                                 }
                             }
                         }
