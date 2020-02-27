@@ -86,28 +86,6 @@ fn test_reelection_2a() {
 }
 
 #[test]
-fn test_basic_agree_tmp() {
-    let servers = 5;
-    let mut cfg = Config::new(servers, false);
-    cfg.begin("Test (2B): basic agreement");
-
-    let iters = 3;
-    for index in 1..=iters {
-        let (nd, _) = cfg.n_committed(index);
-        if nd > 0 {
-            panic!("some have committed before start()");
-        }
-
-        let xindex = cfg.one(Entry { x: index * 100 }, servers, false);
-        if xindex != index {
-            panic!("got index {} but expected {}", xindex, index);
-        }
-    }
-
-    cfg.end()
-}
-
-#[test]
 fn test_basic_agree_2b() {
     let servers = 5;
     let mut cfg = Config::new(servers, false);
@@ -345,6 +323,86 @@ fn test_rejoin_2b() {
     cfg.connect(leader2);
 
     cfg.one(Entry { x: 105 }, servers, true);
+
+    cfg.end();
+}
+
+#[test]
+fn test_backup_tmp() {
+    let servers = 5;
+    let mut cfg = Config::new(servers, false);
+
+    cfg.begin("Test (2B): leader backs up quickly over incorrect follower logs");
+
+    let mut random = rand::thread_rng();
+    cfg.one(random_entry(&mut random), servers, true);
+
+    info!("1. put leader and one follower in a partition");
+    let leader1 = cfg.check_one_leader();
+    cfg.disconnect((leader1 + 2) % servers);
+    cfg.disconnect((leader1 + 3) % servers);
+    cfg.disconnect((leader1 + 4) % servers);
+
+    info!("2. submit lots of commands that won't commit");
+    for _i in 0..50 {
+        let _ = cfg.rafts.lock().unwrap()[leader1]
+            .as_ref()
+            .unwrap()
+            .start(&random_entry(&mut random));
+    }
+
+    thread::sleep(RAFT_ELECTION_TIMEOUT / 2);
+
+    cfg.disconnect((leader1 + 0) % servers);
+    cfg.disconnect((leader1 + 1) % servers);
+
+    info!("3. allow other partition to recover");
+    cfg.connect((leader1 + 2) % servers);
+    cfg.connect((leader1 + 3) % servers);
+    cfg.connect((leader1 + 4) % servers);
+
+    info!("4. lots of successful commands to new group.");
+    for _i in 0..50 {
+        cfg.one(random_entry(&mut random), 3, true);
+    }
+
+    info!("5. now another partitioned leader and one follower");
+    let leader2 = cfg.check_one_leader();
+    let mut other = (leader1 + 2) % servers;
+    if leader2 == other {
+        other = (leader2 + 1) % servers;
+    }
+    cfg.disconnect(other);
+
+    info!("6. lots more commands that won't commit");
+    for _i in 0..50 {
+        let _ = cfg.rafts.lock().unwrap()[leader2]
+            .as_ref()
+            .unwrap()
+            .start(&random_entry(&mut random));
+    }
+
+    thread::sleep(RAFT_ELECTION_TIMEOUT / 2);
+
+    info!("7. bring original leader back to life,");
+    for i in 0..servers {
+        cfg.disconnect(i);
+    }
+    cfg.connect((leader1 + 0) % servers);
+    cfg.connect((leader1 + 1) % servers);
+    cfg.connect(other);
+
+    info!("8. lots of successful commands to new group.");
+    for _i in 0..50 {
+        info!("8. _{}_ lots of successful commands to new group.", _i);
+        cfg.one(random_entry(&mut random), 3, true);
+    }
+
+    info!("9. now everyone");
+    for i in 0..servers {
+        cfg.connect(i);
+    }
+    cfg.one(random_entry(&mut random), servers, true);
 
     cfg.end();
 }
