@@ -22,6 +22,7 @@ use self::persister::*;
 use crate::proto::raftpb::*;
 
 const RPC_TIMEOUT: Duration = Duration::from_millis(10);
+const INTERVAL_PERIOD: Duration = Duration::from_millis(200);
 
 pub struct ApplyMsg {
     pub command_valid: bool,
@@ -296,10 +297,6 @@ impl Raft {
     }
 
     fn update_state(&mut self, is_leader: bool, term: u64) {
-        let t = self.state.term;
-        if t > term {
-            error!("TERM OF {} DECREASED FROM {} TO {}", self.me, t, term);
-        }
         self.state = Arc::new(State { is_leader, term });
     }
 
@@ -319,7 +316,10 @@ impl Raft {
             vote_granted: false,
         };
         if current_term > args.term {
-            warn!("{} refused {} , term", self.me, args.candidate_id);
+            warn!(
+                "[handle_vote_request]{} refused {} , term",
+                self.me, args.candidate_id
+            );
             return resp;
         }
 
@@ -327,7 +327,7 @@ impl Raft {
         if current_term == args.term && voted_for.is_some() && voted_for != Some(args.candidate_id)
         {
             warn!(
-                "{} refused {} , voted_for:{:?}",
+                "[handle_vote_request] {} refused {} , voted_for:{:?}",
                 self.me, args.candidate_id, voted_for
             );
             return resp;
@@ -339,9 +339,31 @@ impl Raft {
             .last()
             .map(|l| l.term)
             .unwrap_or(0);
-        if last_log_index > args.last_log_index || last_log_term > args.last_log_term {
+        // §5.4.1  Raft determines which of two logs is more up-to-date
+        // by comparing the index and term of the last entries in the
+        // logs. If the logs have last entries with different terms, then
+        // the log with the later term is more up-to-date. If the logs
+        // end with the same term, then whichever log is longer is
+        // more up-to-date.
+        let is_up_to_date = if args.last_log_term > last_log_term {
+            true
+        } else if args.last_log_term == last_log_term {
+            args.last_log_index >= last_log_index
+        } else {
+            false
+        };
+        if !is_up_to_date {
+            warn!(
+                "[handle_vote_request] {} refused {} , last_log_index:{} > {} or last_log_term {} > {}",
+                self.me, args.candidate_id, last_log_index, args.last_log_index, last_log_term, args.last_log_term,
+            );
+
             return resp;
         }
+        warn!(
+            "[handle_vote_request] {} voted for {}",
+            self.me, args.candidate_id,
+        );
         self.persistent_state.voted_for = Some(args.candidate_id);
         self.update_state(false, args.term);
         resp.vote_granted = true;
@@ -383,7 +405,6 @@ impl Raft {
             .then(move |result| match result {
                 Ok(v) => {
                     if v.is_empty() {
-                        error!("VOTE RESULT IS EMPTY");
                         Ok(())
                     } else {
                         let mut votes = 0;
@@ -438,11 +459,9 @@ impl Raft {
             prev_log_term: prev_term,
         };
         peer.spawn({
-            let me = self.me;
             peer.append_entries(&args)
                 .map_err(Error::Rpc)
                 .then(move |reply| {
-                    info!("Heartbeat result from {},me:{}, {:?}", i, me, reply);
                     let _ = sender.send(reply.clone());
                     if let Ok(reply) = reply {
                         let _ = event_sender.unbounded_send(Event::AppendEntriesResult(
@@ -450,12 +469,6 @@ impl Raft {
                             index,
                             reply.clone(),
                         ));
-                        error!(
-                            "sent sent sent sent sent sent sent {}, {}, {:?}",
-                            i, index, reply
-                        );
-                    } else {
-                        error!("Heartbeat result from {}, {:?}", i, reply);
                     }
                     Ok(())
                 })
@@ -528,7 +541,8 @@ impl Raft {
         }
         // Since the tester limits the frequency of RPC calls,
         // election timeout is larger than 150ms-300ms in section5.2,
-        let millis = rand::thread_rng().gen_range(500, 1000);
+        let p = INTERVAL_PERIOD.as_millis() as u64;
+        let millis = rand::thread_rng().gen_range(p * 3, p * 6);
         let election_timeout = Duration::from_millis(millis);
         if self.last_heartbeat.elapsed() > election_timeout {
             self.last_heartbeat = Instant::now();
@@ -606,21 +620,22 @@ impl Node {
                 .map(|(args, sender): (Args, oneshot::Sender<Reply>)| (None, Some((args, sender))));
             let event_rx = event_rx.map_err(|_| ()).map(|v: Event| (Some(v), None));
 
-            Interval::new(Duration::from_millis(200))
+            Interval::new(INTERVAL_PERIOD)
                 .map(|_| (None, None))
                 .map_err(|_| ())
                 .select(rx)
                 .select(event_rx)
+                .map(|v| {
+                    let r = raft.lock().unwrap();
+                    let last_i = r.persistent_state.log.len();
+                    let last_t = r.get_log(last_i).map(|t| t.term).unwrap_or(0);
+                    info!(
+                        "Interval {}, is_leader:{}, term:{}, last_log_term:{}, last_log_index:{}",
+                        r.me, r.state.is_leader, r.state.term, last_t, last_i
+                    );
+                    v
+                })
                 .for_each(|(event, args)| {
-                    {
-                        let r = raft.lock().unwrap();
-                        let last_i = r.persistent_state.log.len();
-                        let last_t = r.get_log(last_i).map(|t| t.term).unwrap_or(0);
-                        info!(
-                            "Interval {}, is_leader:{}, term:{}, last_term:{}",
-                            r.me, r.state.is_leader, r.state.term, last_t
-                        );
-                    };
                     if let Some(args) = args {
                         match args {
                             (Args::RequestVote(args), tx) => {
@@ -733,7 +748,6 @@ impl RaftService for Node {
     //
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     fn request_vote(&self, args: RequestVoteArgs) -> RpcFuture<RequestVoteReply> {
-        info!("request_vote {:?}", args);
         let (tx, rx) = oneshot::channel();
         let result = self
             .sender
@@ -752,8 +766,14 @@ impl RaftService for Node {
         {
             let rf = self.raft.lock().unwrap();
             info!(
-                "append_entries {}:{} got {}:{}",
-                rf.me, rf.state.term, args.leader_id, args.term
+                "append_entries {}:{} got {}:{}, term:{},prev_term:{},entries:{}",
+                rf.me,
+                rf.state.term,
+                args.leader_id,
+                args.term,
+                args.term,
+                args.prev_log_term,
+                args.entries.len()
             );
         }
         let (tx, rx) = oneshot::channel();
