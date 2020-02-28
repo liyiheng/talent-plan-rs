@@ -245,7 +245,6 @@ impl Raft {
             receivers.push(rx);
         }
         let peer = &self.peers[self.me];
-        let event_sender = self.event_ch.clone().unwrap();
         let peer_count = self.peers.len();
         let (index, term) = (self.persistent_state.log.len(), self.state.term);
         peer.spawn({
@@ -272,17 +271,11 @@ impl Raft {
                         return Ok(());
                     }
                     let mut amt = 0;
-                    for (i, reply) in replies {
+                    for reply in replies {
                         if reply.is_err() {
                             continue;
                         }
                         let reply = reply.unwrap();
-                        // TODO move to append_entries_to
-                        let _ = event_sender.unbounded_send(Event::AppendEntriesResult(
-                            i,
-                            index,
-                            reply.clone(),
-                        ));
                         if reply.success {
                             amt += 1;
                         } else if term < reply.term {
@@ -325,7 +318,7 @@ impl Raft {
         let prev_i = args.prev_log_index as usize;
         if prev_i > 0 {
             let prev_t = args.prev_log_term;
-            let prev_log = self.persistent_state.log.get(prev_i - 1);
+            let prev_log = self.get_log(prev_i);
             if prev_log.is_none() || prev_log.unwrap().term != prev_t {
                 warn!(
                     "{} refused {}, doesn’t contain an entry at prev_log_index",
@@ -335,6 +328,7 @@ impl Raft {
                 return resp;
             }
         }
+        // TODO Bug: Got uncommited entries from old leader
         // 3. If an existing entry conflicts with a new one (same index
         // but different terms), delete the existing entry and all that
         // follow it (§5.3)
@@ -356,12 +350,17 @@ impl Raft {
         // min(leaderCommit, index of last new entry)
         if args.leader_commit > self.commit_index as u64 {
             let i = self.persistent_state.log.len();
+            let ci = self.commit_index;
             self.commit_index = i.min(args.leader_commit as usize);
-        }
-        if args.term != self.state.term {
+            let entries_cnt = last_i - prev_i;
             warn!(
-                "{} => {}, term: {} => {}",
-                args.leader_id, self.me, self.state.term, args.term,
+                "Commit index of {}, {}=>{}, leader:{},  entries:{}, logs:{}",
+                self.me,
+                ci,
+                self.commit_index,
+                args.leader_id,
+                entries_cnt,
+                self.persistent_state.log.len()
             );
         }
         self.update_state(false, args.term);
@@ -415,7 +414,7 @@ impl Raft {
             .last()
             .map(|l| l.term)
             .unwrap_or(0);
-        if last_log_index > args.last_log_index || last_log_term > args.term {
+        if last_log_index > args.last_log_index || last_log_term > args.last_log_term {
             return resp;
         }
         self.persistent_state.voted_for = Some(args.candidate_id);
@@ -428,10 +427,16 @@ impl Raft {
         let term = self.state.term + 1;
         self.update_state(false, term);
         self.persistent_state.voted_for = Some(self.me as u64);
+        let last_term = self
+            .persistent_state
+            .log
+            .last()
+            .map(|l| l.term)
+            .unwrap_or(0);
         let args = RequestVoteArgs {
             candidate_id: self.me as u64,
             last_log_index: self.persistent_state.log.len() as u64,
-            last_log_term: self.state.term,
+            last_log_term: last_term,
             term: self.state.term,
         };
         let mut receivers = Vec::with_capacity(self.peers.len());
@@ -473,20 +478,18 @@ impl Raft {
         self.peers[self.me].spawn(fut);
     }
 
-    fn append_entries_to(
-        &mut self,
-        i: usize,
-    ) -> oneshot::Receiver<(usize, Result<AppendEntriesReply>)> {
+    fn append_entries_to(&mut self, i: usize) -> oneshot::Receiver<Result<AppendEntriesReply>> {
+        let index = self.persistent_state.log.len();
+        let event_sender = self.event_ch.clone().unwrap();
         let (sender, rx) = oneshot::channel();
         if i == self.me {
             self.last_heartbeat = Instant::now();
-            let _ = sender.send((
-                self.me,
-                Ok(AppendEntriesReply {
-                    success: true,
-                    term: self.state.term,
-                }),
-            ));
+            let reply = AppendEntriesReply {
+                success: true,
+                term: self.state.term,
+            };
+            let _ = sender.send(Ok(reply.clone()));
+            let _ = event_sender.unbounded_send(Event::AppendEntriesResult(i, index, reply));
             return rx;
         }
         let peer = &self.peers[i];
@@ -510,11 +513,25 @@ impl Raft {
             prev_log_term: prev_term,
         };
         peer.spawn({
+            let me = self.me;
             peer.append_entries(&args)
                 .map_err(Error::Rpc)
                 .then(move |reply| {
-                    info!("Result from {}, {:?}", i, reply);
-                    let _ = sender.send((i, reply));
+                    info!("Heartbeat result from {},me:{}, {:?}", i, me, reply);
+                    let _ = sender.send(reply.clone());
+                    if let Ok(reply) = reply {
+                        let _ = event_sender.unbounded_send(Event::AppendEntriesResult(
+                            i,
+                            index,
+                            reply.clone(),
+                        ));
+                        error!(
+                            "sent sent sent sent sent sent sent {}, {}, {:?}",
+                            i, index, reply
+                        );
+                    } else {
+                        error!("Heartbeat result from {}, {:?}", i, reply);
+                    }
                     Ok(())
                 })
         });
@@ -541,6 +558,11 @@ impl Raft {
     fn step(&mut self) {
         while self.commit_index > self.last_applied {
             self.last_applied += 1;
+            let t = self.persistent_state.log[self.last_applied - 1].term;
+            info!(
+                "apply log, t:{}, i:{}, peer {}, is_leader:{}",
+                t, self.last_applied, self.me, self.state.is_leader,
+            );
             let _ = self.apply_ch.unbounded_send(ApplyMsg {
                 command_valid: true,
                 command_index: self.last_applied as u64,
@@ -565,6 +587,12 @@ impl Raft {
                         .filter(|v| **v >= n)
                         .count();
                     if c > majority && self.persistent_state.log[n - 1].term == self.state.term {
+                        if self.commit_index != n {
+                            warn!(
+                                "Commit index of {}, {} to {}",
+                                self.me, self.commit_index, n
+                            );
+                        }
                         self.commit_index = n;
                         break;
                     }
@@ -665,14 +693,12 @@ impl Node {
                 .for_each(|(event, args)| {
                     {
                         let r = raft.lock().unwrap();
-                        if r.state.is_leader {
-                            info!(
-                                "LeaderInterval {} {}, {:?}",
-                                r.me,
-                                r.state.term,
-                                r.persistent_state.log.last()
-                            );
-                        }
+                        let last_i = r.persistent_state.log.len();
+                        let last_t = r.get_log(last_i).map(|t| t.term).unwrap_or(0);
+                        info!(
+                            "Interval {}, is_leader:{}, term:{}, last_term:{}",
+                            r.me, r.state.is_leader, r.state.term, last_t
+                        );
                     };
                     if let Some(args) = args {
                         match args {
@@ -708,7 +734,13 @@ impl Node {
                                     );
                                 } else if rf.leader_state.next_index[peer] > 1 {
                                     rf.leader_state.next_index[peer] -= 1;
-                                    let _ = rf.append_entries_to(peer);
+                                    warn!(
+                                        "Decrease next_index of {} to {}",
+                                        peer, rf.leader_state.next_index[peer]
+                                    );
+                                    if rf.state.is_leader {
+                                        let _ = rf.append_entries_to(peer);
+                                    }
                                 }
                             }
                         }
