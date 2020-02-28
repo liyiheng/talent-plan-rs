@@ -175,7 +175,6 @@ impl Raft {
         args: &RequestVoteArgs,
     ) -> oneshot::Receiver<Result<RequestVoteReply>> {
         let (tx, rx) = oneshot::channel();
-        // let (tx, rx) = sync_channel::<Result<RequestVoteReply>>(1);
         if server == self.me {
             let _ = tx.send(Ok(RequestVoteReply {
                 vote_granted: true,
@@ -193,10 +192,8 @@ impl Raft {
                 }),
         );
         rx
-        //crate::your_code_here((server, args, tx, rx))
     }
 
-    // Trait Message cannot be made into object, using handle_cmd and Vec<u8>
     fn start<M>(&mut self, command: &M) -> Result<(u64, u64)>
     where
         M: labcodec::Message,
@@ -214,87 +211,15 @@ impl Raft {
             term: self.state.term,
         };
         self.persistent_state.log.push(entry);
-        let (tx, _rx) = oneshot::channel();
-        self.send_heartbeat(Some(tx));
-        // rx.wait()
-        Ok((self.persistent_state.log.len() as u64, self.state.term))
-        // Your code here (2B).
-    }
-
-    fn handle_cmd2(&mut self, cmd: Vec<u8>, tx: oneshot::Sender<Reply>) {
-        if !self.state.is_leader() {
-            let _ = tx.send(Reply::Cmd(Err(Error::NotLeader)));
-            return;
-        }
-        let entry = LogEntry {
-            data: cmd,
-            term: self.state.term,
-        };
-        self.persistent_state.log.push(entry);
-        self.send_heartbeat(Some(tx));
-    }
-
-    fn send_heartbeat(&mut self, sender: Option<oneshot::Sender<Reply>>) {
-        let mut receivers = Vec::with_capacity(self.peers.len());
-        for i in 0..self.peers.len() {
-            let rx = self
-                .append_entries_to(i)
-                .map(Some)
-                .map_err(|_| ())
-                .select(Delay::new(RPC_TIMEOUT).map_err(|_| ()).map(|_| None));
-            receivers.push(rx);
-        }
-        let peer = &self.peers[self.me];
-        let peer_count = self.peers.len();
+        self.send_heartbeat();
         let (index, term) = (self.persistent_state.log.len(), self.state.term);
-        peer.spawn({
-            futures::stream::futures_unordered(receivers)
-                .fold(vec![], |mut acc, (v, _)| {
-                    if let Some(v) = v {
-                        acc.push(v);
-                    }
-                    future::ok(acc)
-                })
-                .then(move |replies| {
-                    let timeout_reply = Reply::Cmd(Err(Error::Rpc(RpcError::Timeout)));
-                    if replies.is_err() {
-                        if let Some(sender) = sender {
-                            let _ = sender.send(timeout_reply);
-                        }
-                        return Ok(());
-                    }
-                    let replies = replies.ok().unwrap();
-                    if replies.is_empty() {
-                        if let Some(sender) = sender {
-                            let _ = sender.send(timeout_reply);
-                        }
-                        return Ok(());
-                    }
-                    let mut amt = 0;
-                    for reply in replies {
-                        if reply.is_err() {
-                            continue;
-                        }
-                        let reply = reply.unwrap();
-                        if reply.success {
-                            amt += 1;
-                        } else if term < reply.term {
-                            if let Some(sender) = sender {
-                                let _ = sender.send(Reply::Cmd(Err(errors::Error::NotLeader)));
-                            }
-                            return Ok(());
-                        }
-                    }
-                    if let Some(sender) = sender {
-                        if amt > peer_count / 2 {
-                            let _ = sender.send(Reply::Cmd(Ok((index as u64, term))));
-                        } else {
-                            let _ = sender.send(timeout_reply);
-                        }
-                    }
-                    Ok(())
-                })
-        });
+        Ok((index as u64, term))
+    }
+
+    fn send_heartbeat(&mut self) {
+        for i in 0..self.peers.len() {
+            let _ = self.append_entries_to(i);
+        }
     }
 }
 
@@ -551,7 +476,7 @@ impl Raft {
                 next_index: vec![log_size + 1; self.peers.len()],
                 match_index: vec![0; self.peers.len()],
             };
-            self.send_heartbeat(None);
+            self.send_heartbeat();
         }
     }
 
@@ -598,7 +523,7 @@ impl Raft {
                     }
                 }
             }
-            self.send_heartbeat(None);
+            self.send_heartbeat();
             return;
         }
         // Since the tester limits the frequency of RPC calls,
@@ -628,8 +553,6 @@ impl Raft {
         let _ = &self.last_applied;
         let _ = &self.leader_state.next_index;
         let _ = &self.leader_state.match_index;
-        let (tx, _) = oneshot::channel();
-        self.handle_cmd2(vec![], tx);
     }
 }
 
@@ -656,14 +579,12 @@ pub struct Node {
 enum Args {
     RequestVote(RequestVoteArgs),
     AppendEntries(AppendEntriesArgs),
-    Cmd(Vec<u8>),
 }
 
 #[derive(Clone)]
 enum Reply {
     RequestVote(RequestVoteReply),
     AppendEntries(AppendEntriesReply),
-    Cmd(Result<(u64, u64)>),
 }
 
 enum Event {
@@ -709,9 +630,6 @@ impl Node {
                             (Args::AppendEntries(args), tx) => {
                                 let resp = raft.lock().unwrap().handle_append_entries(args);
                                 let _ = tx.send(Reply::AppendEntries(resp));
-                            }
-                            (Args::Cmd(dat), tx) => {
-                                raft.lock().unwrap().handle_cmd2(dat, tx);
                             }
                         }
                         return Ok(());
@@ -777,21 +695,7 @@ impl Node {
     where
         M: labcodec::Message,
     {
-        let mut buf = vec![];
-        labcodec::encode(command, &mut buf).map_err(errors::Error::Encode)?;
-        let (tx, rx) = oneshot::channel();
-        let result = self
-            .sender
-            .unbounded_send((Args::Cmd(buf), tx))
-            .map_err(|e| RpcError::Other(e.to_string()));
-        if let Err(e) = result {
-            return Err(errors::Error::Rpc(RpcError::Other(e.to_string())));
-        }
-        if let Reply::Cmd(result) = rx.wait().unwrap() {
-            result
-        } else {
-            unreachable!()
-        }
+        self.raft.lock().unwrap().start(command)
     }
 
     /// The current term of this peer.
