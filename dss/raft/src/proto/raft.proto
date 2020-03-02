@@ -35,4 +35,5 @@ message LogEntry {
 message AppendEntriesReply {
   uint64 term = 1;
   bool success = 2;
+  uint64 last_index_with_term = 3;
 }

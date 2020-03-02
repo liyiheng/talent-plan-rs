@@ -236,6 +236,7 @@ impl Raft {
 impl Raft {
     fn handle_event(&mut self, event: Event) {
         match event {
+            Event::Shutdown => {}
             Event::VoteResult(term, cnt) => {
                 self.handle_vote_result(term, cnt);
             }
@@ -258,13 +259,16 @@ impl Raft {
                         "{} got higher term, not a leader now {}",
                         self.me, self.state.is_leader
                     );
-                } else if self.leader_state.next_index[peer] > 1 {
-                    self.leader_state.next_index[peer] -= 1;
+                } else if self.state.is_leader {
+                    let mut last_i = reply.last_index_with_term as usize;
+                    // self.leader_state.next_index[peer] -= 1;
+                    if last_i == 0 {
+                        last_i = 1;
+                    }
+                    self.leader_state.next_index[peer] = last_i;
                     let ni = self.leader_state.next_index[peer];
                     info!("Decrease next_index of {} to {}", peer, ni);
-                    if self.state.is_leader {
-                        let _ = self.append_entries_to(peer);
-                    }
+                    let _ = self.append_entries_to(peer);
                 }
             }
         }
@@ -275,6 +279,7 @@ impl Raft {
         let mut resp = AppendEntriesReply {
             term: current_term,
             success: false,
+            last_index_with_term: 0,
         };
         // 1. Reply false if term < currentTerm (§5.1)
         if args.term < current_term {
@@ -295,7 +300,18 @@ impl Raft {
                     "{} refused {}, doesn’t contain an entry at prev_log_index",
                     self.me, args.leader_id
                 );
-
+                if prev_log.is_none() {
+                    resp.last_index_with_term = self.persistent_state.log.len() as u64;
+                } else {
+                    let mut last_i_with_t = 0;
+                    for (i, l) in self.persistent_state.log.iter().enumerate().rev() {
+                        if l.term == prev_t {
+                            last_i_with_t = i as u64 + 1;
+                            break;
+                        }
+                    }
+                    resp.last_index_with_term = last_i_with_t;
+                }
                 return resp;
             }
         }
@@ -388,6 +404,7 @@ impl Raft {
             "[handle_vote_request] {} voted for {}",
             self.me, args.candidate_id,
         );
+        self.last_heartbeat = Instant::now();
         self.persistent_state.voted_for = Some(args.candidate_id);
         self.update_state(false, args.term);
         self.persist();
@@ -463,6 +480,7 @@ impl Raft {
             let reply = AppendEntriesReply {
                 success: true,
                 term: self.state.term,
+                last_index_with_term: self.persistent_state.log.len() as u64 + 1,
             };
             let _ = sender.send(Ok(reply.clone()));
             let _ = event_sender.unbounded_send(Event::AppendEntriesResult(i, index, reply));
@@ -634,6 +652,7 @@ enum Event {
     VoteResult(u64, usize),
     // peer_id, index, reply
     AppendEntriesResult(usize, usize, AppendEntriesReply),
+    Shutdown,
 }
 
 #[derive(Clone)]
@@ -652,6 +671,15 @@ impl Node {
                 .map(|_| None)
                 .map_err(|_| ())
                 .select(event_rx)
+                .take_while(|event| {
+                    let f = if let Some(Event::Shutdown) = event {
+                        info!("Peer {} shutdown", raft.lock().unwrap().me);
+                        false
+                    } else {
+                        true
+                    };
+                    future::ok(f)
+                })
                 .for_each(|event| {
                     if let Some(event) = event {
                         raft.lock().unwrap().handle_event(event);
@@ -718,6 +746,7 @@ impl Node {
     /// threads you generated with this Raft Node.
     pub fn kill(&self) {
         // Your code here, if desired.
+        let _ = self.sender.unbounded_send(Event::Shutdown);
     }
 }
 

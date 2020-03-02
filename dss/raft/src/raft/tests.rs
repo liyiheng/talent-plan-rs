@@ -582,6 +582,80 @@ fn test_persist1_2c() {
 }
 
 #[test]
+fn test_tmp() {
+    let servers = 5;
+    let mut cfg = Config::new(servers, false);
+
+    cfg.begin("Test (2C): more persistence");
+
+    let mut index = 1;
+    for _ in 0..5 {
+        info!("Entry:{}", index);
+        cfg.one(Entry { x: 10 + index }, servers, true);
+        index += 1;
+
+        let leader1 = cfg.check_one_leader();
+
+        info!(
+            "disconnect: {}, {}",
+            (leader1 + 1) % servers,
+            (leader1 + 2) % servers
+        );
+        cfg.disconnect((leader1 + 1) % servers);
+        cfg.disconnect((leader1 + 2) % servers);
+
+        info!("Entry:{}", index);
+        cfg.one(Entry { x: 10 + index }, servers - 2, true);
+        index += 1;
+        info!(
+            "disconnect: {}, {}, {}",
+            (leader1 + 0) % servers,
+            (leader1 + 3) % servers,
+            (leader1 + 4) % servers
+        );
+        cfg.disconnect((leader1 + 0) % servers);
+        cfg.disconnect((leader1 + 3) % servers);
+        cfg.disconnect((leader1 + 4) % servers);
+        info!(
+            "start: {}, {}",
+            (leader1 + 1) % servers,
+            (leader1 + 2) % servers
+        );
+
+        cfg.start1((leader1 + 1) % servers);
+        cfg.start1((leader1 + 2) % servers);
+        info!(
+            "reconnect: {}, {}",
+            (leader1 + 1) % servers,
+            (leader1 + 2) % servers
+        );
+        cfg.connect((leader1 + 1) % servers);
+        cfg.connect((leader1 + 2) % servers);
+
+        thread::sleep(RAFT_ELECTION_TIMEOUT);
+        info!("start: {}", (leader1 + 3) % servers);
+        cfg.start1((leader1 + 3) % servers);
+        info!("connect: {}", (leader1 + 3) % servers);
+        cfg.connect((leader1 + 3) % servers);
+
+        info!("Entry:{}", index);
+        cfg.one(Entry { x: 10 + index }, servers - 2, true);
+        index += 1;
+        info!(
+            "reconnect: {}, {}",
+            (leader1 + 4) % servers,
+            (leader1 + 0) % servers
+        );
+        cfg.connect((leader1 + 4) % servers);
+        cfg.connect((leader1 + 0) % servers);
+    }
+
+    cfg.one(Entry { x: 1000 }, servers, true);
+
+    cfg.end();
+}
+
+#[test]
 fn test_persist2_2c() {
     let servers = 5;
     let mut cfg = Config::new(servers, false);
