@@ -131,7 +131,9 @@ impl Raft {
         // Example:
         // labcodec::encode(&self.xxx, &mut data).unwrap();
         // labcodec::encode(&self.yyy, &mut data).unwrap();
-        // self.persister.save_raft_state(data);
+        let mut data = vec![];
+        labcodec::encode(&self.persistent_state, &mut data).unwrap();
+        self.persister.save_raft_state(data);
     }
 
     /// restore previously persisted state.
@@ -140,6 +142,12 @@ impl Raft {
             // bootstrap without any state?
             return;
         }
+        let persistent_state = labcodec::decode::<PersistentState>(data).unwrap();
+        self.persistent_state = persistent_state;
+        self.state = Arc::new(State {
+            is_leader: false,
+            term: self.persistent_state.current_term,
+        });
         // Your code here (2C).
         // Example:
         // match labcodec::decode(data) {
@@ -212,6 +220,7 @@ impl Raft {
             term: self.state.term,
         };
         self.persistent_state.log.push(entry);
+        self.persist();
         self.send_heartbeat();
         let (index, term) = (self.persistent_state.log.len(), self.state.term);
         Ok((index as u64, term))
@@ -244,6 +253,7 @@ impl Raft {
                     self.leader_state.next_index[peer] = index + 1;
                 } else if reply.term > self.state.term {
                     self.update_state(false, reply.term);
+                    self.persist();
                     info!(
                         "{} got higher term, not a leader now {}",
                         self.me, self.state.is_leader
@@ -316,12 +326,14 @@ impl Raft {
         self.persistent_state.voted_for = None;
         resp.success = true;
         self.last_heartbeat = Instant::now();
+        self.persist();
         resp
     }
 
     fn update_state(&mut self, is_leader: bool, term: u64) {
         let s = self.state.clone();
         self.state = Arc::new(State { is_leader, term });
+        self.persistent_state.current_term = term;
         info!("State of {}, {:?} => {:?}", self.me, s, self.state);
     }
 
@@ -378,6 +390,7 @@ impl Raft {
         );
         self.persistent_state.voted_for = Some(args.candidate_id);
         self.update_state(false, args.term);
+        self.persist();
         resp.vote_granted = true;
         resp
     }
@@ -386,6 +399,7 @@ impl Raft {
         let term = self.state.term + 1;
         self.update_state(false, term);
         self.persistent_state.voted_for = Some(self.me as u64);
+        self.persist();
         let last_term = self
             .persistent_state
             .log
@@ -499,6 +513,7 @@ impl Raft {
         let is_leader = cnt > self.peers.len() / 2;
         self.update_state(is_leader, term);
         self.persistent_state.voted_for = None;
+        self.persist();
         if is_leader {
             let log_size = self.persistent_state.log.len();
             self.leader_state = LeaderState {
