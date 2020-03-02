@@ -339,6 +339,14 @@ fn test_backup_tmp() {
 
     info!("1. put leader and one follower in a partition");
     let leader1 = cfg.check_one_leader();
+
+    info!(
+        "disconnect {}, {}, {}, {}",
+        (leader1 + 1) % servers,
+        (leader1 + 2) % servers,
+        (leader1 + 3) % servers,
+        (leader1 + 4) % servers
+    );
     cfg.disconnect((leader1 + 2) % servers);
     cfg.disconnect((leader1 + 3) % servers);
     cfg.disconnect((leader1 + 4) % servers);
@@ -353,10 +361,21 @@ fn test_backup_tmp() {
 
     thread::sleep(RAFT_ELECTION_TIMEOUT / 2);
 
+    info!(
+        "disconnect {}, {}",
+        (leader1 + 0) % servers,
+        (leader1 + 1) % servers
+    );
     cfg.disconnect((leader1 + 0) % servers);
     cfg.disconnect((leader1 + 1) % servers);
 
     info!("3. allow other partition to recover");
+    info!(
+        "reconnect {}, {}, {}",
+        (leader1 + 2) % servers,
+        (leader1 + 3) % servers,
+        (leader1 + 4) % servers
+    );
     cfg.connect((leader1 + 2) % servers);
     cfg.connect((leader1 + 3) % servers);
     cfg.connect((leader1 + 4) % servers);
@@ -373,6 +392,7 @@ fn test_backup_tmp() {
         other = (leader2 + 1) % servers;
     }
     cfg.disconnect(other);
+    info!("disconnect {}", other);
 
     info!("6. lots more commands that won't commit");
     for _i in 0..50 {
@@ -381,6 +401,8 @@ fn test_backup_tmp() {
             .unwrap()
             .start(&random_entry(&mut random));
     }
+    let (n, _) = cfg.n_committed(100);
+    assert_eq!(n, 0, "Should not commited");
 
     thread::sleep(RAFT_ELECTION_TIMEOUT / 2);
 
@@ -388,6 +410,12 @@ fn test_backup_tmp() {
     for i in 0..servers {
         cfg.disconnect(i);
     }
+    info!(
+        "disconnect all, connect {}, {}, {}",
+        (leader1 + 0) % servers,
+        (leader1 + 1) % servers,
+        other
+    );
     cfg.connect((leader1 + 0) % servers);
     cfg.connect((leader1 + 1) % servers);
     cfg.connect(other);

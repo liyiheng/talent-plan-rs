@@ -234,7 +234,7 @@ impl Raft {
         // 1. Reply false if term < currentTerm (§5.1)
         if args.term < current_term {
             warn!(
-                "{} refused {}, {} < {}",
+                "{} refused {}, term {} < {}",
                 self.me, args.leader_id, args.term, current_term
             );
             return resp;
@@ -254,7 +254,6 @@ impl Raft {
                 return resp;
             }
         }
-        // TODO Bug: Got uncommited entries from old leader
         // 3. If an existing entry conflicts with a new one (same index
         // but different terms), delete the existing entry and all that
         // follow it (§5.3)
@@ -276,18 +275,7 @@ impl Raft {
         // min(leaderCommit, index of last new entry)
         if args.leader_commit > self.commit_index as u64 {
             let i = self.persistent_state.log.len();
-            let ci = self.commit_index;
             self.commit_index = i.min(args.leader_commit as usize);
-            let entries_cnt = last_i - prev_i;
-            warn!(
-                "Commit index of {}, {}=>{}, leader:{},  entries:{}, logs:{}",
-                self.me,
-                ci,
-                self.commit_index,
-                args.leader_id,
-                entries_cnt,
-                self.persistent_state.log.len()
-            );
         }
         self.update_state(false, args.term);
         self.persistent_state.voted_for = None;
@@ -297,7 +285,9 @@ impl Raft {
     }
 
     fn update_state(&mut self, is_leader: bool, term: u64) {
+        let s = self.state.clone();
         self.state = Arc::new(State { is_leader, term });
+        info!("State of {}, {:?} => {:?}", self.me, s, self.state);
     }
 
     // index starts from 1
@@ -316,20 +306,12 @@ impl Raft {
             vote_granted: false,
         };
         if current_term > args.term {
-            warn!(
-                "[handle_vote_request]{} refused {} , term",
-                self.me, args.candidate_id
-            );
             return resp;
         }
 
         let voted_for = self.persistent_state.voted_for;
         if current_term == args.term && voted_for.is_some() && voted_for != Some(args.candidate_id)
         {
-            warn!(
-                "[handle_vote_request] {} refused {} , voted_for:{:?}",
-                self.me, args.candidate_id, voted_for
-            );
             return resp;
         }
         let last_log_index = self.persistent_state.log.len() as u64;
@@ -353,14 +335,9 @@ impl Raft {
             false
         };
         if !is_up_to_date {
-            warn!(
-                "[handle_vote_request] {} refused {} , last_log_index:{} > {} or last_log_term {} > {}",
-                self.me, args.candidate_id, last_log_index, args.last_log_index, last_log_term, args.last_log_term,
-            );
-
             return resp;
         }
-        warn!(
+        info!(
             "[handle_vote_request] {} voted for {}",
             self.me, args.candidate_id,
         );
@@ -408,14 +385,18 @@ impl Raft {
                         Ok(())
                     } else {
                         let mut votes = 0;
+                        let mut max_term = term;
                         for e in v {
                             if let Ok(e) = e {
                                 if e.vote_granted {
                                     votes += 1;
+                                } else if e.term > term {
+                                    max_term = e.term;
+                                    break;
                                 }
                             }
                         }
-                        let _ = event_sender.unbounded_send(Event::VoteResult(term, votes));
+                        let _ = event_sender.unbounded_send(Event::VoteResult(max_term, votes));
                         Ok(())
                     }
                 }
@@ -481,7 +462,7 @@ impl Raft {
             return;
         }
         let is_leader = cnt > self.peers.len() / 2;
-        self.update_state(is_leader, self.state.term);
+        self.update_state(is_leader, term);
         self.persistent_state.voted_for = None;
         if is_leader {
             let log_size = self.persistent_state.log.len();
@@ -526,7 +507,7 @@ impl Raft {
                         .count();
                     if c > majority && self.persistent_state.log[n - 1].term == self.state.term {
                         if self.commit_index != n {
-                            warn!(
+                            info!(
                                 "Commit index of {}, {} to {}",
                                 self.me, self.commit_index, n
                             );
@@ -625,15 +606,17 @@ impl Node {
                 .map_err(|_| ())
                 .select(rx)
                 .select(event_rx)
-                .map(|v| {
-                    let r = raft.lock().unwrap();
-                    let last_i = r.persistent_state.log.len();
-                    let last_t = r.get_log(last_i).map(|t| t.term).unwrap_or(0);
-                    info!(
+                .map(|(e, a)| {
+                    if e.is_none() && a.is_none() {
+                        let r = raft.lock().unwrap();
+                        let last_i = r.persistent_state.log.len();
+                        let last_t = r.get_log(last_i).map(|t| t.term).unwrap_or(0);
+                        info!(
                         "Interval {}, is_leader:{}, term:{}, last_log_term:{}, last_log_index:{}",
                         r.me, r.state.is_leader, r.state.term, last_t, last_i
                     );
-                    v
+                    }
+                    (e, a)
                 })
                 .for_each(|(event, args)| {
                     if let Some(args) = args {
@@ -661,13 +644,13 @@ impl Node {
                                     rf.leader_state.next_index[peer] = index + 1;
                                 } else if reply.term > rf.state.term {
                                     rf.update_state(false, reply.term);
-                                    warn!(
+                                    info!(
                                         "{} got higher term, not a leader now {}",
                                         rf.me, rf.state.is_leader
                                     );
                                 } else if rf.leader_state.next_index[peer] > 1 {
                                     rf.leader_state.next_index[peer] -= 1;
-                                    warn!(
+                                    info!(
                                         "Decrease next_index of {} to {}",
                                         peer, rf.leader_state.next_index[peer]
                                     );
