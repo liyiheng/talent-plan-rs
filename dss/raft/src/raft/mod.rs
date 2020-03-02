@@ -225,6 +225,41 @@ impl Raft {
 }
 
 impl Raft {
+    fn handle_event(&mut self, event: Event) {
+        match event {
+            Event::VoteResult(term, cnt) => {
+                self.handle_vote_result(term, cnt);
+            }
+            Event::RequestVote(args, tx) => {
+                let resp = self.handle_vote_request(args);
+                let _ = tx.send(Reply::RequestVote(resp));
+            }
+            Event::AppendEntries(args, tx) => {
+                let resp = self.handle_append_entries(args);
+                let _ = tx.send(Reply::AppendEntries(resp));
+            }
+            Event::AppendEntriesResult(peer, index, reply) => {
+                if reply.success {
+                    self.leader_state.match_index[peer] = index;
+                    self.leader_state.next_index[peer] = index + 1;
+                } else if reply.term > self.state.term {
+                    self.update_state(false, reply.term);
+                    info!(
+                        "{} got higher term, not a leader now {}",
+                        self.me, self.state.is_leader
+                    );
+                } else if self.leader_state.next_index[peer] > 1 {
+                    self.leader_state.next_index[peer] -= 1;
+                    let ni = self.leader_state.next_index[peer];
+                    info!("Decrease next_index of {} to {}", peer, ni);
+                    if self.state.is_leader {
+                        let _ = self.append_entries_to(peer);
+                    }
+                }
+            }
+        }
+    }
+
     fn handle_append_entries(&mut self, args: AppendEntriesArgs) -> AppendEntriesReply {
         let current_term = self.state.term();
         let mut resp = AppendEntriesReply {
@@ -475,6 +510,13 @@ impl Raft {
     }
 
     fn step(&mut self) {
+        let last_i = self.persistent_state.log.len();
+        let last_t = self.get_log(last_i).map(|t| t.term).unwrap_or(0);
+        info!(
+            "Interval {}, is_leader:{}, term:{}, last_log_term:{}, last_log_index:{}",
+            self.me, self.state.is_leader, self.state.term, last_t, last_i
+        );
+
         while self.commit_index > self.last_applied {
             self.last_applied += 1;
             let t = self.persistent_state.log[self.last_applied - 1].term;
@@ -567,13 +609,16 @@ impl Raft {
 // ```
 #[derive(Clone)]
 pub struct Node {
-    sender: UnboundedSender<(Args, oneshot::Sender<Reply>)>,
+    sender: UnboundedSender<Event>,
     raft: Arc<Mutex<Raft>>,
 }
 
-enum Args {
-    RequestVote(RequestVoteArgs),
-    AppendEntries(AppendEntriesArgs),
+enum Event {
+    RequestVote(RequestVoteArgs, oneshot::Sender<Reply>),
+    AppendEntries(AppendEntriesArgs, oneshot::Sender<Reply>),
+    VoteResult(u64, usize),
+    // peer_id, index, reply
+    AppendEntriesResult(usize, usize, AppendEntriesReply),
 }
 
 #[derive(Clone)]
@@ -582,93 +627,28 @@ enum Reply {
     AppendEntries(AppendEntriesReply),
 }
 
-enum Event {
-    VoteResult(u64, usize),
-    // peer_id, index, reply
-    AppendEntriesResult(usize, usize, AppendEntriesReply),
-}
-
 impl Node {
-    fn start_raft_thread(
-        raft: Arc<Mutex<Raft>>,
-    ) -> UnboundedSender<(Args, oneshot::Sender<Reply>)> {
-        let (tx, rx) = futures::sync::mpsc::unbounded();
+    fn start_raft_thread(raft: Arc<Mutex<Raft>>) -> UnboundedSender<Event> {
         let (event_tx, event_rx) = futures::sync::mpsc::unbounded();
-        raft.lock().unwrap().event_ch = Some(event_tx);
+        raft.lock().unwrap().event_ch = Some(event_tx.clone());
         std::thread::spawn(move || {
-            let rx = rx
-                .map_err(|_| ())
-                .map(|(args, sender): (Args, oneshot::Sender<Reply>)| (None, Some((args, sender))));
-            let event_rx = event_rx.map_err(|_| ()).map(|v: Event| (Some(v), None));
-
+            let event_rx = event_rx.map_err(|_| ()).map(Some);
             Interval::new(INTERVAL_PERIOD)
-                .map(|_| (None, None))
+                .map(|_| None)
                 .map_err(|_| ())
-                .select(rx)
                 .select(event_rx)
-                .map(|(e, a)| {
-                    if e.is_none() && a.is_none() {
-                        let r = raft.lock().unwrap();
-                        let last_i = r.persistent_state.log.len();
-                        let last_t = r.get_log(last_i).map(|t| t.term).unwrap_or(0);
-                        info!(
-                        "Interval {}, is_leader:{}, term:{}, last_log_term:{}, last_log_index:{}",
-                        r.me, r.state.is_leader, r.state.term, last_t, last_i
-                    );
-                    }
-                    (e, a)
-                })
-                .for_each(|(event, args)| {
-                    if let Some(args) = args {
-                        match args {
-                            (Args::RequestVote(args), tx) => {
-                                let resp = raft.lock().unwrap().handle_vote_request(args);
-                                let _ = tx.send(Reply::RequestVote(resp));
-                            }
-                            (Args::AppendEntries(args), tx) => {
-                                let resp = raft.lock().unwrap().handle_append_entries(args);
-                                let _ = tx.send(Reply::AppendEntries(resp));
-                            }
-                        }
-                        return Ok(());
-                    }
+                .for_each(|event| {
                     if let Some(event) = event {
-                        match event {
-                            Event::VoteResult(term, cnt) => {
-                                raft.lock().unwrap().handle_vote_result(term, cnt);
-                            }
-                            Event::AppendEntriesResult(peer, index, reply) => {
-                                let mut rf = raft.lock().unwrap();
-                                if reply.success {
-                                    rf.leader_state.match_index[peer] = index;
-                                    rf.leader_state.next_index[peer] = index + 1;
-                                } else if reply.term > rf.state.term {
-                                    rf.update_state(false, reply.term);
-                                    info!(
-                                        "{} got higher term, not a leader now {}",
-                                        rf.me, rf.state.is_leader
-                                    );
-                                } else if rf.leader_state.next_index[peer] > 1 {
-                                    rf.leader_state.next_index[peer] -= 1;
-                                    info!(
-                                        "Decrease next_index of {} to {}",
-                                        peer, rf.leader_state.next_index[peer]
-                                    );
-                                    if rf.state.is_leader {
-                                        let _ = rf.append_entries_to(peer);
-                                    }
-                                }
-                            }
-                        }
-                        return Ok(());
+                        raft.lock().unwrap().handle_event(event);
+                    } else {
+                        raft.lock().unwrap().step();
                     }
-                    raft.lock().unwrap().step();
                     Ok(())
                 })
                 .wait()
                 .unwrap();
         });
-        tx
+        event_tx
     }
     /// Create a new raft service.
     pub fn new(raft: Raft) -> Node {
@@ -734,7 +714,7 @@ impl RaftService for Node {
         let (tx, rx) = oneshot::channel();
         let result = self
             .sender
-            .unbounded_send((Args::RequestVote(args), tx))
+            .unbounded_send(Event::RequestVote(args, tx))
             .map_err(|e| RpcError::Other(e.to_string()));
         if let Err(e) = result {
             return Box::new(future::err(e));
@@ -762,7 +742,7 @@ impl RaftService for Node {
         let (tx, rx) = oneshot::channel();
         let result = self
             .sender
-            .unbounded_send((Args::AppendEntries(args), tx))
+            .unbounded_send(Event::AppendEntries(args, tx))
             .map_err(|e| RpcError::Other(e.to_string()));
         if let Err(e) = result {
             return Box::new(future::err(e));
