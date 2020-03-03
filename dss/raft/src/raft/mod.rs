@@ -21,7 +21,8 @@ use self::errors::*;
 use self::persister::*;
 use crate::proto::raftpb::*;
 
-const RPC_TIMEOUT: Duration = Duration::from_millis(10);
+const RPC_TIMEOUT: Duration = Duration::from_millis(5);
+const MIN_ELECTION_TIMEOUT: Duration = Duration::from_millis(300);
 const INTERVAL_PERIOD: Duration = Duration::from_millis(200);
 
 pub struct ApplyMsg {
@@ -81,7 +82,7 @@ pub struct Raft {
     event_ch: Option<UnboundedSender<Event>>,
     commit_index: usize,
     last_applied: usize,
-    last_heartbeat: Instant,
+    timer: Instant,
     persistent_state: PersistentState,
     leader_state: LeaderState,
 }
@@ -103,7 +104,6 @@ impl Raft {
     ) -> Raft {
         let raft_state = persister.raft_state();
         let persistent_state = labcodec::decode::<PersistentState>(&raft_state).unwrap();
-        // Your initialization code here (2A, 2B, 2C).
         let mut rf = Raft {
             peers,
             persister,
@@ -113,14 +113,13 @@ impl Raft {
             event_ch: None,
             commit_index: 0,
             last_applied: 0,
-            last_heartbeat: Instant::now(),
+            timer: Instant::now(),
             persistent_state,
             leader_state: LeaderState::default(),
         };
         // initialize from state persisted before a crash
         rf.restore(&raft_state);
         rf
-        //crate::your_code_here((rf, apply_ch))
     }
 
     /// save Raft's persistent state to stable storage,
@@ -234,6 +233,9 @@ impl Raft {
 }
 
 impl Raft {
+    fn reset_timer(&mut self) {
+        self.timer = Instant::now();
+    }
     fn handle_event(&mut self, event: Event) {
         match event {
             Event::Shutdown => {}
@@ -341,7 +343,7 @@ impl Raft {
         self.update_state(false, args.term);
         self.persistent_state.voted_for = None;
         resp.success = true;
-        self.last_heartbeat = Instant::now();
+        self.reset_timer();
         self.persist();
         resp
     }
@@ -369,12 +371,20 @@ impl Raft {
             vote_granted: false,
         };
         if current_term > args.term {
+            info!(
+                "{} refused {}, term: {}>{}",
+                self.me, args.candidate_id, current_term, args.term
+            );
             return resp;
         }
 
         let voted_for = self.persistent_state.voted_for;
         if current_term == args.term && voted_for.is_some() && voted_for != Some(args.candidate_id)
         {
+            info!(
+                "{} refused {}, voted for {:?}",
+                self.me, args.candidate_id, voted_for
+            );
             return resp;
         }
         let last_log_index = self.persistent_state.log.len() as u64;
@@ -398,13 +408,17 @@ impl Raft {
             false
         };
         if !is_up_to_date {
+            info!(
+                "{} refused {}, log not up-to-date",
+                self.me, args.candidate_id
+            );
             return resp;
         }
         info!(
             "[handle_vote_request] {} voted for {}",
             self.me, args.candidate_id,
         );
-        self.last_heartbeat = Instant::now();
+        self.reset_timer();
         self.persistent_state.voted_for = Some(args.candidate_id);
         self.update_state(false, args.term);
         self.persist();
@@ -437,8 +451,10 @@ impl Raft {
         }
         let rx = futures::stream::futures_unordered(receivers);
         let event_sender = self.event_ch.clone().unwrap();
+        let me = self.me;
         let fut = rx
-            .fold(vec![], |mut acc, (v, _)| {
+            .fold(vec![], move |mut acc, (v, _)| {
+                info!("Vote result of {}: {:?}", me, v);
                 if let Some(v) = v {
                     acc.push(v);
                 }
@@ -476,7 +492,7 @@ impl Raft {
         let event_sender = self.event_ch.clone().unwrap();
         let (sender, rx) = oneshot::channel();
         if i == self.me {
-            self.last_heartbeat = Instant::now();
+            self.reset_timer();
             let reply = AppendEntriesReply {
                 success: true,
                 term: self.state.term,
@@ -597,11 +613,11 @@ impl Raft {
         }
         // Since the tester limits the frequency of RPC calls,
         // election timeout is larger than 150ms-300ms in section5.2,
-        let p = INTERVAL_PERIOD.as_millis() as u64;
-        let millis = rand::thread_rng().gen_range(p * 3, p * 6);
+        let p = MIN_ELECTION_TIMEOUT.as_millis() as u64;
+        let millis = rand::thread_rng().gen_range(p, p * 2);
         let election_timeout = Duration::from_millis(millis);
-        if self.last_heartbeat.elapsed() > election_timeout {
-            self.last_heartbeat = Instant::now();
+        if self.timer.elapsed() > election_timeout {
+            self.reset_timer();
             info!("{} start election", self.me);
             self.start_election();
         }
@@ -642,6 +658,8 @@ impl Raft {
 // ```
 #[derive(Clone)]
 pub struct Node {
+    // Use sender to communicate with raft thread,
+    // sometimes it's convenient to use Mutex directly
     sender: UnboundedSender<Event>,
     raft: Arc<Mutex<Raft>>,
 }
@@ -672,13 +690,13 @@ impl Node {
                 .map_err(|_| ())
                 .select(event_rx)
                 .take_while(|event| {
-                    let f = if let Some(Event::Shutdown) = event {
+                    let has_next = if let Some(Event::Shutdown) = event {
                         info!("Peer {} shutdown", raft.lock().unwrap().me);
                         false
                     } else {
                         true
                     };
-                    future::ok(f)
+                    future::ok(has_next)
                 })
                 .for_each(|event| {
                     if let Some(event) = event {
