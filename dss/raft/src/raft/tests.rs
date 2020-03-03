@@ -582,80 +582,6 @@ fn test_persist1_2c() {
 }
 
 #[test]
-fn test_tmp() {
-    let servers = 5;
-    let mut cfg = Config::new(servers, false);
-
-    cfg.begin("Test (2C): more persistence");
-
-    let mut index = 1;
-    for _ in 0..5 {
-        info!("Entry:{}", index);
-        cfg.one(Entry { x: 10 + index }, servers, true);
-        index += 1;
-
-        let leader1 = cfg.check_one_leader();
-
-        info!(
-            "disconnect: {}, {}",
-            (leader1 + 1) % servers,
-            (leader1 + 2) % servers
-        );
-        cfg.disconnect((leader1 + 1) % servers);
-        cfg.disconnect((leader1 + 2) % servers);
-
-        info!("Entry:{}", index);
-        cfg.one(Entry { x: 10 + index }, servers - 2, true);
-        index += 1;
-        info!(
-            "disconnect: {}, {}, {}",
-            (leader1 + 0) % servers,
-            (leader1 + 3) % servers,
-            (leader1 + 4) % servers
-        );
-        cfg.disconnect((leader1 + 0) % servers);
-        cfg.disconnect((leader1 + 3) % servers);
-        cfg.disconnect((leader1 + 4) % servers);
-        info!(
-            "start: {}, {}",
-            (leader1 + 1) % servers,
-            (leader1 + 2) % servers
-        );
-
-        cfg.start1((leader1 + 1) % servers);
-        cfg.start1((leader1 + 2) % servers);
-        info!(
-            "reconnect: {}, {}",
-            (leader1 + 1) % servers,
-            (leader1 + 2) % servers
-        );
-        cfg.connect((leader1 + 1) % servers);
-        cfg.connect((leader1 + 2) % servers);
-
-        thread::sleep(RAFT_ELECTION_TIMEOUT);
-        info!("start: {}", (leader1 + 3) % servers);
-        cfg.start1((leader1 + 3) % servers);
-        info!("connect: {}", (leader1 + 3) % servers);
-        cfg.connect((leader1 + 3) % servers);
-
-        info!("Entry:{}", index);
-        cfg.one(Entry { x: 10 + index }, servers - 2, true);
-        index += 1;
-        info!(
-            "reconnect: {}, {}",
-            (leader1 + 4) % servers,
-            (leader1 + 0) % servers
-        );
-        cfg.connect((leader1 + 4) % servers);
-        cfg.connect((leader1 + 0) % servers);
-    }
-
-    cfg.one(Entry { x: 1000 }, servers, true);
-
-    cfg.end();
-}
-
-#[test]
 fn test_persist2_2c() {
     let servers = 5;
     let mut cfg = Config::new(servers, false);
@@ -1073,4 +999,86 @@ fn test_reliable_churn_2c() {
 #[test]
 fn test_unreliable_churn_2c() {
     internal_churn(true);
+}
+
+#[test]
+fn test_unreliable_churn_ttmmpp() {
+    internal_churn(true);
+}
+
+#[test]
+fn test_figure_8_unreliable_tmp() {
+    let servers = 5;
+    let mut cfg = Config::new(servers, true);
+
+    cfg.begin("Test (2C): Figure 8 (unreliable)");
+    let mut random = rand::thread_rng();
+    cfg.one(
+        Entry {
+            x: random.gen::<u64>() % 10000,
+        },
+        1,
+        true,
+    );
+
+    let mut nup = servers;
+    for iters in 0..1000 {
+        if iters == 200 {
+            cfg.net.set_long_reordering(true);
+        }
+        let mut leader = None;
+        for i in 0..servers {
+            if cfg.rafts.lock().unwrap()[i]
+                .as_ref()
+                .unwrap()
+                .start(&Entry {
+                    x: random.gen::<u64>() % 10000,
+                })
+                .is_ok()
+                && cfg.connected[i]
+            {
+                leader = Some(i);
+            }
+        }
+
+        if (random.gen::<usize>() % 1000) < 100 {
+            let ms = random.gen::<u64>() % (RAFT_ELECTION_TIMEOUT.as_millis() as u64 / 2);
+            thread::sleep(Duration::from_millis(ms as u64));
+        } else {
+            let ms = random.gen::<u64>() % 13;
+            thread::sleep(Duration::from_millis(ms));
+        }
+
+        if let Some(leader) = leader {
+            if (random.gen::<usize>() % 1000) < (RAFT_ELECTION_TIMEOUT.as_millis() as usize) / 2 {
+                cfg.disconnect(leader);
+                nup -= 1;
+            }
+        }
+
+        if nup < 3 {
+            let s = random.gen::<usize>() % servers;
+            if !cfg.connected[s] {
+                cfg.connect(s);
+                nup += 1;
+            }
+        }
+    }
+
+    for i in 0..servers {
+        if !cfg.connected[i] {
+            cfg.connect(i);
+        }
+    }
+
+    info!("All servers conected");
+    cfg.one(
+        Entry {
+            x: random.gen::<u64>() % 10000,
+        },
+        servers,
+        true,
+    );
+
+    cfg.end();
 }

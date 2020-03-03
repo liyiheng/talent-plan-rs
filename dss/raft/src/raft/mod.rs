@@ -21,7 +21,7 @@ use self::errors::*;
 use self::persister::*;
 use crate::proto::raftpb::*;
 
-const RPC_TIMEOUT: Duration = Duration::from_millis(5);
+const RPC_TIMEOUT: Duration = Duration::from_millis(100);
 const MIN_ELECTION_TIMEOUT: Duration = Duration::from_millis(300);
 const INTERVAL_PERIOD: Duration = Duration::from_millis(200);
 
@@ -267,9 +267,10 @@ impl Raft {
                     if last_i == 0 {
                         last_i = 1;
                     }
+                    let old = self.leader_state.next_index[peer];
                     self.leader_state.next_index[peer] = last_i;
                     let ni = self.leader_state.next_index[peer];
-                    info!("Decrease next_index of {} to {}", peer, ni);
+                    info!("Decrease next_index of {}: {}=>{}", peer, old, ni);
                     let _ = self.append_entries_to(peer);
                 }
             }
@@ -545,6 +546,10 @@ impl Raft {
             return;
         }
         let is_leader = cnt > self.peers.len() / 2;
+        if self.persistent_state.voted_for != Some(self.me as u64) {
+            // It's a follower now
+            return;
+        }
         self.update_state(is_leader, term);
         self.persistent_state.voted_for = None;
         self.persist();
@@ -734,7 +739,9 @@ impl Node {
     where
         M: labcodec::Message,
     {
-        self.raft.lock().unwrap().start(command)
+        let x = self.raft.lock().unwrap().start(command);
+        info!("Start: {:?}, result:{:?}", command, x);
+        x
     }
 
     /// The current term of this peer.
