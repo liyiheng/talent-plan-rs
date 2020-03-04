@@ -446,8 +446,12 @@ impl Raft {
         };
         let mut receivers = Vec::with_capacity(self.peers.len());
         for i in 0..self.peers.len() {
-            let rx = self.send_request_vote(i, &args).map_err(|_| ()).map(Some);
-            let rx = rx.select(Delay::new(RPC_TIMEOUT).map_err(|_| ()).map(|_| None));
+            let rx = self.send_request_vote(i, &args).map_err(|_| ());
+            let rx = rx.select(
+                Delay::new(RPC_TIMEOUT)
+                    .map_err(|_| ())
+                    .map(|_| Err(Error::Rpc(RpcError::Timeout))),
+            );
             receivers.push(rx);
         }
         let rx = futures::stream::futures_unordered(receivers);
@@ -455,33 +459,27 @@ impl Raft {
         let me = self.me;
         let fut = rx
             .fold(vec![], move |mut acc, (v, _)| {
-                info!("Vote result of {}: {:?}", me, v);
-                if let Some(v) = v {
-                    acc.push(v);
-                }
+                acc.push(v);
                 future::ok(acc)
             })
             .map_err(|_| RpcError::Timeout)
             .then(move |result| match result {
                 Ok(v) => {
-                    if v.is_empty() {
-                        Ok(())
-                    } else {
-                        let mut votes = 0;
-                        let mut max_term = term;
-                        for e in v {
-                            if let Ok(e) = e {
-                                if e.vote_granted {
-                                    votes += 1;
-                                } else if e.term > term {
-                                    max_term = e.term;
-                                    break;
-                                }
+                    let mut votes = 0;
+                    let mut max_term = term;
+                    for e in v {
+                        info!("Vote result of {}: {:?}", me, e);
+                        if let Ok(e) = e {
+                            if e.vote_granted {
+                                votes += 1;
+                            } else if e.term > term {
+                                max_term = e.term;
+                                break;
                             }
                         }
-                        let _ = event_sender.unbounded_send(Event::VoteResult(max_term, votes));
-                        Ok(())
                     }
+                    let _ = event_sender.unbounded_send(Event::VoteResult(max_term, votes));
+                    Ok(())
                 }
                 Err(_) => Ok(()),
             });
