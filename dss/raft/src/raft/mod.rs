@@ -21,9 +21,9 @@ use self::errors::*;
 use self::persister::*;
 use crate::proto::raftpb::*;
 
-const RPC_TIMEOUT: Duration = Duration::from_millis(100);
-const MIN_ELECTION_TIMEOUT: Duration = Duration::from_millis(300);
-const INTERVAL_PERIOD: Duration = Duration::from_millis(200);
+const RPC_TIMEOUT: Duration = Duration::from_millis(50);
+const MIN_ELECTION_TIMEOUT: Duration = Duration::from_millis(200);
+const INTERVAL_PERIOD: Duration = Duration::from_millis(80);
 
 pub struct ApplyMsg {
     pub command_valid: bool,
