@@ -82,7 +82,7 @@ pub struct Raft {
     event_ch: Option<UnboundedSender<Event>>,
     commit_index: usize,
     last_applied: usize,
-    timer: Instant,
+    timeout_at: Instant,
     persistent_state: PersistentState,
     leader_state: LeaderState,
 }
@@ -113,7 +113,7 @@ impl Raft {
             event_ch: None,
             commit_index: 0,
             last_applied: 0,
-            timer: Instant::now(),
+            timeout_at: Instant::now(),
             persistent_state,
             leader_state: LeaderState::default(),
         };
@@ -234,11 +234,37 @@ impl Raft {
 
 impl Raft {
     fn reset_timer(&mut self) {
-        self.timer = Instant::now();
+        // Since the tester limits the frequency of RPC calls,
+        // election timeout is larger than 150ms-300ms in section5.2,
+        let p = MIN_ELECTION_TIMEOUT.as_millis() as u64;
+        let millis = rand::thread_rng().gen_range(p, p * 2);
+        let dur = Duration::from_millis(millis);
+        self.timeout_at = Instant::now() + dur;
+        if self.event_ch.is_none() {
+            return;
+        }
+        let event_ch = self.event_ch.clone().unwrap();
+        let fut = Delay::new_at(self.timeout_at).then(move |_| {
+            let _ = event_ch.unbounded_send(Event::StartElection);
+            Ok(())
+        });
+        self.peers[self.me].spawn(fut)
     }
     fn handle_event(&mut self, event: Event) {
         match event {
             Event::Shutdown => {}
+            Event::StartElection => {
+                if self.timeout_at > Instant::now() {
+                    // Drop this event
+                    return;
+                }
+                if self.state.is_leader {
+                    return;
+                }
+                self.reset_timer();
+                info!("{} start election", self.me);
+                self.start_election();
+            }
             Event::VoteResult(term, cnt) => {
                 self.handle_vote_result(term, cnt);
             }
@@ -614,16 +640,6 @@ impl Raft {
             self.send_heartbeat();
             return;
         }
-        // Since the tester limits the frequency of RPC calls,
-        // election timeout is larger than 150ms-300ms in section5.2,
-        let p = MIN_ELECTION_TIMEOUT.as_millis() as u64;
-        let millis = rand::thread_rng().gen_range(p, p * 2);
-        let election_timeout = Duration::from_millis(millis);
-        if self.timer.elapsed() > election_timeout {
-            self.reset_timer();
-            info!("{} start election", self.me);
-            self.start_election();
-        }
     }
 }
 
@@ -674,6 +690,7 @@ enum Event {
     // peer_id, index, reply
     AppendEntriesResult(usize, usize, AppendEntriesReply),
     Shutdown,
+    StartElection,
 }
 
 #[derive(Clone)]
@@ -686,6 +703,7 @@ impl Node {
     fn start_raft_thread(raft: Arc<Mutex<Raft>>) -> UnboundedSender<Event> {
         let (event_tx, event_rx) = futures::sync::mpsc::unbounded();
         raft.lock().unwrap().event_ch = Some(event_tx.clone());
+        raft.lock().unwrap().reset_timer();
         std::thread::spawn(move || {
             let event_rx = event_rx.map_err(|_| ()).map(Some);
             Interval::new(INTERVAL_PERIOD)
