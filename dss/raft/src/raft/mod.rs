@@ -127,9 +127,6 @@ impl Raft {
     /// see paper's Figure 2 for a description of what should be persistent.
     fn persist(&mut self) {
         // Your code here (2C).
-        // Example:
-        // labcodec::encode(&self.xxx, &mut data).unwrap();
-        // labcodec::encode(&self.yyy, &mut data).unwrap();
         let mut data = vec![];
         labcodec::encode(&self.persistent_state, &mut data).unwrap();
         self.persister.save_raft_state(data);
@@ -147,17 +144,6 @@ impl Raft {
             is_leader: false,
             term: self.persistent_state.current_term,
         });
-        // Your code here (2C).
-        // Example:
-        // match labcodec::decode(data) {
-        //     Ok(o) => {
-        //         self.xxx = o.xxx;
-        //         self.yyy = o.yyy;
-        //     }
-        //     Err(e) => {
-        //         panic!("{:?}", e);
-        //     }
-        // }
     }
 
     /// example code to send a RequestVote RPC to a server.
