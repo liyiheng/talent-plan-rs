@@ -72,43 +72,43 @@ impl KvServer {
         let last_reqs = server.last_reqs.clone();
         let cmd_chs = server.cmd_chs.clone();
         std::thread::spawn(move || {
-            let _ = apply_ch.for_each(|msg| {
-                if !msg.command_valid || msg.command.is_empty() {
-                    return Ok(());
-                }
-                let cmd: Command = labcodec::decode(&msg.command).unwrap();
-                let cmd2 = cmd.clone();
-                let mut req_ids_mutex = last_reqs.lock().unwrap();
-                let mut data = data.write().unwrap();
-                let req_id = req_ids_mutex.get(&cmd.client);
-                if req_id.is_none() || *req_id.unwrap() < cmd.req_id {
-                    req_ids_mutex.insert(cmd.client.clone(), cmd.req_id);
-                    // 1. put 2. append 3. get
-                    match cmd.op {
-                        1 => {
-                            data.insert(cmd.key, cmd.value.unwrap());
-                        }
-                        2 => {
-                            if data.contains_key(&cmd.key) {
-                                data.get_mut(&cmd.key)
-                                    .unwrap()
-                                    .push_str(&cmd.value.unwrap_or_default());
-                            } else {
+            let _ = apply_ch
+                .filter(|msg| msg.command_valid)
+                .map(|msg| {
+                    let cmd: Command = labcodec::decode(&msg.command).unwrap();
+                    (cmd, msg.command_index)
+                })
+                .for_each(|(cmd, index)| {
+                    let cmd2 = cmd.clone();
+                    let mut req_ids_mutex = last_reqs.lock().unwrap();
+                    let mut data = data.write().unwrap();
+                    let req_id = req_ids_mutex.get(&cmd.client);
+                    if req_id.is_none() || *req_id.unwrap() < cmd.req_id {
+                        req_ids_mutex.insert(cmd.client.clone(), cmd.req_id);
+                        // 1. put 2. append 3. get
+                        match cmd.op {
+                            1 => {
                                 data.insert(cmd.key, cmd.value.unwrap());
                             }
+                            2 => {
+                                if data.contains_key(&cmd.key) {
+                                    data.get_mut(&cmd.key)
+                                        .unwrap()
+                                        .push_str(&cmd.value.unwrap_or_default());
+                                } else {
+                                    data.insert(cmd.key, cmd.value.unwrap());
+                                }
+                            }
+                            3 => {}
+                            _ => {}
                         }
-                        3 => {}
-                        _ => {}
                     }
-                }
-                let mut cmd_chs = cmd_chs.lock().unwrap();
-
-                let index = msg.command_index;
-                if let Some(tx) = cmd_chs.remove(&index) {
-                    let _ = tx.send(cmd2);
-                }
-                Ok(())
-            });
+                    let mut cmd_chs = cmd_chs.lock().unwrap();
+                    if let Some(tx) = cmd_chs.remove(&index) {
+                        let _ = tx.send(cmd2);
+                    }
+                    Ok(())
+                });
             info!("apply_ch receiver finished");
         });
         server
