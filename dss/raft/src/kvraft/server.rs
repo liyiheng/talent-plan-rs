@@ -73,22 +73,22 @@ impl KvServer {
         let last_reqs = server.last_reqs.clone();
         std::thread::spawn(move || {
             let _ = apply_ch.for_each(|msg| {
-                if !msg.command_valid {
+                if !msg.command_valid || msg.command.is_empty() {
                     return Ok(());
                 }
                 let cmd: Command = labcodec::decode(&msg.command).unwrap();
                 let cmd2 = cmd.clone();
                 let mut req_ids_mutex = last_reqs.lock().unwrap();
+                let mut data = data.write().unwrap();
                 let req_id = req_ids_mutex.get(&cmd.client);
                 if req_id.is_none() || *req_id.unwrap() < cmd.req_id {
                     req_ids_mutex.insert(cmd.client.clone(), cmd.req_id);
                     // 1. put 2. append 3. get
                     match cmd.op {
                         1 => {
-                            data.write().unwrap().insert(cmd.key, cmd.value.unwrap());
+                            data.insert(cmd.key, cmd.value.unwrap());
                         }
                         2 => {
-                            let mut data = data.write().unwrap();
                             if data.contains_key(&cmd.key) {
                                 data.get_mut(&cmd.key)
                                     .unwrap()
