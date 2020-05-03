@@ -20,7 +20,6 @@ pub struct KvServer {
     maxraftstate: Option<usize>,
     // Your definitions here.
     data: Arc<RwLock<HashMap<String, String>>>,
-    indexes: Arc<Mutex<HashMap<u64, Command>>>,
     cmd_chs: Arc<Mutex<HashMap<u64, oneshot::Sender<Command>>>>,
     last_reqs: Arc<Mutex<HashMap<String, u64>>>,
 }
@@ -66,12 +65,10 @@ impl KvServer {
             me,
             maxraftstate,
             data: Arc::default(),
-            indexes: Arc::default(),
             cmd_chs: Arc::default(),
             last_reqs: Arc::default(),
         };
         let data = server.data.clone();
-        let indexes = server.indexes.clone();
         let last_reqs = server.last_reqs.clone();
         let cmd_chs = server.cmd_chs.clone();
         std::thread::spawn(move || {
@@ -104,11 +101,6 @@ impl KvServer {
                         _ => {}
                     }
                 }
-                // deprecated
-                indexes
-                    .lock()
-                    .unwrap()
-                    .insert(msg.command_index, cmd2.clone());
                 let mut cmd_chs = cmd_chs.lock().unwrap();
 
                 let index = msg.command_index;
