@@ -30,13 +30,11 @@ struct Command {
     key: String,
     #[prost(string, optional, tag = "2")]
     value: Option<String>,
-    #[prost(bool, tag = "3")]
-    delete: bool,
-    #[prost(int32, tag = "4")]
+    #[prost(int32, tag = "3")]
     op: i32,
-    #[prost(string, tag = "5")]
+    #[prost(string, tag = "4")]
     client: String,
-    #[prost(uint64, tag = "6")]
+    #[prost(uint64, tag = "5")]
     req_id: u64,
 }
 
@@ -45,7 +43,6 @@ impl From<PutAppendRequest> for Command {
         Command {
             key: req.key,
             value: Some(req.value),
-            delete: false,
             req_id: req.req_id,
             op: req.op,
             client: req.client,
@@ -85,10 +82,23 @@ impl KvServer {
                 let req_id = req_ids_mutex.get(&cmd.client);
                 if req_id.is_none() || *req_id.unwrap() < cmd.req_id {
                     req_ids_mutex.insert(cmd.client.clone(), cmd.req_id);
-                    if cmd.delete {
-                        data.write().unwrap().remove(&cmd.key);
-                    } else {
-                        data.write().unwrap().insert(cmd.key, cmd.value.unwrap());
+                    // 1. put 2. append 3. get
+                    match cmd.op {
+                        1 => {
+                            data.write().unwrap().insert(cmd.key, cmd.value.unwrap());
+                        }
+                        2 => {
+                            let mut data = data.write().unwrap();
+                            if data.contains_key(&cmd.key) {
+                                data.get_mut(&cmd.key)
+                                    .unwrap()
+                                    .push_str(&cmd.value.unwrap_or_default());
+                            } else {
+                                data.insert(cmd.key, cmd.value.unwrap());
+                            }
+                        }
+                        3 => {}
+                        _ => {}
                     }
                 }
                 indexes.lock().unwrap().insert(msg.command_index, cmd2);
@@ -157,62 +167,77 @@ impl KvService for Node {
             op: 3,
             key,
             value: None,
-            delete: false,
             client,
             req_id,
         };
-        let (sender, rx) = oneshot::channel();
+        let (sender, rx) = oneshot::channel::<Result<GetReply, labrpc::Error>>();
         let server = self.server.clone();
-        std::thread::spawn(move || {
-            let wrong_leader = GetReply {
-                err: String::new(),
-                value: String::new(),
-                wrong_leader: true,
-            };
-            if !server.lock().unwrap().rf.is_leader() {
-                let _ = sender.send(Ok(wrong_leader));
-                return;
-            }
-            let result = server.lock().unwrap().rf.start(&cmd);
-            if let Err(e) = result {
-                if let Error::NotLeader = e {
-                    let _ = sender.send(Ok(wrong_leader));
-                } else {
-                    let _ = sender.send(Err(e));
-                }
-                return;
-            }
+        let v = server
+            .lock()
+            .unwrap()
+            .data
+            .read()
+            .unwrap()
+            .get(&cmd.key)
+            .cloned()
+            .unwrap_or_default();
+        let reply_ok = GetReply {
+            wrong_leader: false,
+            value: v,
+            err: "".to_owned(),
+        };
+        let _ = sender.send(Ok(reply_ok));
 
-            let (index, _term) = result.unwrap();
-            for _ in 0..100 {
-                std::thread::sleep(Duration::from_millis(100));
-                let server = server.lock().unwrap();
-                let mut indexes = server.indexes.lock().unwrap();
-                if !indexes.contains_key(&index) {
-                    continue;
-                }
-                let cmd_applied = indexes.get_mut(&index).take().unwrap();
-                if cmd == *cmd_applied {
-                    let reply_ok = GetReply {
-                        wrong_leader: false,
-                        value: server.data.read().unwrap().get(&cmd.key).unwrap().clone(),
-                        err: "".to_owned(),
-                    };
-                    let _ = sender.send(Ok(reply_ok));
-                    return;
-                } else {
-                    let _ = sender.send(Ok(wrong_leader));
-                    return;
-                }
-            }
+        // std::thread::spawn(move || {
+        //     let wrong_leader = GetReply {
+        //         err: String::new(),
+        //         value: String::new(),
+        //         wrong_leader: true,
+        //     };
+        //     if !server.lock().unwrap().rf.is_leader() {
+        //         let _ = sender.send(Ok(wrong_leader));
+        //         return;
+        //     }
+        //     let result = server.lock().unwrap().rf.start(&cmd);
+        //     if let Err(e) = result {
+        //         if let Error::NotLeader = e {
+        //             let _ = sender.send(Ok(wrong_leader));
+        //         } else {
+        //             let _ = sender.send(Err(e));
+        //         }
+        //         return;
+        //     }
 
-            let reply = GetReply {
-                err: "Timeout".to_owned(),
-                wrong_leader: false,
-                value: "".to_owned(),
-            };
-            let _ = sender.send(Ok(reply));
-        });
+        //     let (index, _term) = result.unwrap();
+        //     for _ in 0..100 {
+        //         std::thread::sleep(Duration::from_millis(100));
+        //         let server = server.lock().unwrap();
+        //         let mut indexes = server.indexes.lock().unwrap();
+        //         if !indexes.contains_key(&index) {
+        //             continue;
+        //         }
+        //         let cmd_applied = indexes.get_mut(&index).take().unwrap();
+        //         if cmd == *cmd_applied {
+        //             let reply_ok = GetReply {
+        //                 wrong_leader: false,
+        //                 value: server.data.read().unwrap().get(&cmd.key).unwrap().clone(),
+        //                 err: "".to_owned(),
+        //             };
+        //             let _ = sender.send(Ok(reply_ok));
+        //             return;
+        //         } else {
+        //             let _ = sender.send(Ok(wrong_leader));
+        //             return;
+        //         }
+        //     }
+
+        //     let reply = GetReply {
+        //         err: "Timeout".to_owned(),
+        //         wrong_leader: false,
+        //         value: "".to_owned(),
+        //     };
+        //     let _ = sender.send(Ok(reply));
+        // });
         Box::new(rx.then(|reply| match reply {
             Ok(Ok(reply)) => Ok(reply),
             Ok(Err(e)) => Err(labrpc::Error::Other(e.to_string())),
