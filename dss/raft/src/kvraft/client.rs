@@ -6,6 +6,8 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+const ERR_RETRY_DUR: Duration = Duration::from_millis(100);
+
 enum Op {
     Put(String, String),
     Append(String, String),
@@ -45,9 +47,6 @@ impl Clerk {
     /// fetch the current value for a key.
     /// returns "" if the key does not exist.
     /// keeps trying forever in the face of all other errors.
-    //
-    // you can send an RPC with code like this:
-    // if let Some(reply) = self.servers[i].get(args).wait() { /* do something */ }
     pub fn get(&self, key: String) -> String {
         let req_id = self.incr_req_id();
         let req = GetRequest {
@@ -57,25 +56,30 @@ impl Clerk {
         };
         let server_cnt = self.servers.len();
         loop {
-            // TODO loop forever?
             let leader = self.leader_id.load(Ordering::Acquire);
-            info!("GetRequest to leader:{}", leader);
+            warn!("Client {}, leader {}, get {}", self.name, leader, req.key);
             let fut = self.servers[leader].get(&req);
             match fut.wait() {
                 Ok(v) => {
                     if v.wrong_leader {
                         let leader = (leader + 1) % server_cnt;
                         self.leader_id.store(leader, Ordering::Release);
-                        // TODO
-                        std::thread::sleep(Duration::from_millis(50));
                         continue;
                     } else if v.err.is_empty() {
                         return v.value;
                     } else {
-                        return v.err;
+                        warn!(
+                            "Client {}, leader {}, get {}, err {}",
+                            self.name, leader, req.key, v.err
+                        );
+                        continue;
                     }
                 }
-                Err(e) => return e.to_string(),
+                Err(e) => {
+                    std::thread::sleep(ERR_RETRY_DUR);
+                    warn!("Client {}, get {}, err {}", self.name, req.key, e);
+                    continue;
+                }
             }
         }
     }
@@ -101,17 +105,25 @@ impl Clerk {
             },
         };
         loop {
-            // FIXME
             let leader = self.leader_id.load(Ordering::Acquire);
             let fut = self.servers[leader].put_append(&req);
-            if let Ok(v) = fut.wait() {
-                if v.wrong_leader {
-                    let leader = (leader + 1) % n_servers;
-                    self.leader_id.store(leader, Ordering::Release);
-                    std::thread::sleep(Duration::from_millis(50));
-                    continue;
-                } else {
-                    break;
+            match fut.wait() {
+                Ok(v) => {
+                    if v.wrong_leader {
+                        let leader = (leader + 1) % n_servers;
+                        self.leader_id.store(leader, Ordering::Release);
+                        warn!(
+                            "Client {}, put_append {}, wrong_leader, next {}",
+                            self.name, req.key, leader
+                        );
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    std::thread::sleep(ERR_RETRY_DUR);
+                    warn!("Client {}, put_append {}, err {}", self.name, req.key, e);
                 }
             }
         }

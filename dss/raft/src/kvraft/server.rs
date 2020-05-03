@@ -21,6 +21,7 @@ pub struct KvServer {
     // Your definitions here.
     data: Arc<RwLock<HashMap<String, String>>>,
     indexes: Arc<Mutex<HashMap<u64, Command>>>,
+    cmd_chs: Arc<Mutex<HashMap<u64, oneshot::Sender<Command>>>>,
     last_reqs: Arc<Mutex<HashMap<String, u64>>>,
 }
 
@@ -66,11 +67,13 @@ impl KvServer {
             maxraftstate,
             data: Arc::default(),
             indexes: Arc::default(),
+            cmd_chs: Arc::default(),
             last_reqs: Arc::default(),
         };
         let data = server.data.clone();
         let indexes = server.indexes.clone();
         let last_reqs = server.last_reqs.clone();
+        let cmd_chs = server.cmd_chs.clone();
         std::thread::spawn(move || {
             let _ = apply_ch.for_each(|msg| {
                 if !msg.command_valid || msg.command.is_empty() {
@@ -101,12 +104,21 @@ impl KvServer {
                         _ => {}
                     }
                 }
-                indexes.lock().unwrap().insert(msg.command_index, cmd2);
+                // deprecated
+                indexes
+                    .lock()
+                    .unwrap()
+                    .insert(msg.command_index, cmd2.clone());
+                let mut cmd_chs = cmd_chs.lock().unwrap();
+
+                let index = msg.command_index;
+                if let Some(tx) = cmd_chs.remove(&index) {
+                    let _ = tx.send(cmd2);
+                }
                 Ok(())
             });
             info!("apply_ch receiver finished");
         });
-
         server
     }
 }
@@ -170,8 +182,9 @@ impl KvService for Node {
             client,
             req_id,
         };
-        let (sender, rx) = oneshot::channel::<Result<GetReply, labrpc::Error>>();
         let server = self.server.clone();
+
+        let (sender, rx) = oneshot::channel::<Result<GetReply, labrpc::Error>>();
         let v = server
             .lock()
             .unwrap()
@@ -188,6 +201,7 @@ impl KvService for Node {
         };
         let _ = sender.send(Ok(reply_ok));
 
+        // let (sender, rx) = oneshot::channel();
         // std::thread::spawn(move || {
         //     let wrong_leader = GetReply {
         //         err: String::new(),
@@ -207,20 +221,33 @@ impl KvService for Node {
         //         }
         //         return;
         //     }
+        //     let (index, _) = result.unwrap();
+        //     let cmd_chs = server.lock().unwrap().cmd_chs.clone();
+        //     if cmd_chs.lock().unwrap().contains_key(&index) {
+        //         let _ = sender.send(Ok(wrong_leader));
+        //         return;
+        //     }
+        //     let rx = {
+        //         let mut cmd_chs = cmd_chs.lock().unwrap();
+        //         let (tx, rx) = oneshot::channel();
+        //         cmd_chs.insert(index, tx);
+        //         rx
+        //     };
 
-        //     let (index, _term) = result.unwrap();
-        //     for _ in 0..100 {
-        //         std::thread::sleep(Duration::from_millis(100));
-        //         let server = server.lock().unwrap();
-        //         let mut indexes = server.indexes.lock().unwrap();
-        //         if !indexes.contains_key(&index) {
-        //             continue;
-        //         }
-        //         let cmd_applied = indexes.get_mut(&index).take().unwrap();
-        //         if cmd == *cmd_applied {
+        //     if let Some(cmd_applied) = recv_with_timeout(rx) {
+        //         if cmd == cmd_applied {
+        //             let v = server
+        //                 .lock()
+        //                 .unwrap()
+        //                 .data
+        //                 .read()
+        //                 .unwrap()
+        //                 .get(&cmd.key)
+        //                 .cloned()
+        //                 .unwrap_or_default();
         //             let reply_ok = GetReply {
         //                 wrong_leader: false,
-        //                 value: server.data.read().unwrap().get(&cmd.key).unwrap().clone(),
+        //                 value: v,
         //                 err: "".to_owned(),
         //             };
         //             let _ = sender.send(Ok(reply_ok));
@@ -265,6 +292,7 @@ impl KvService for Node {
                 let _ = sender.send(Ok(wrong_leader));
                 return;
             }
+
             let result = server.lock().unwrap().rf.start(&cmd);
             if let Err(e) = result {
                 if let Error::NotLeader = e {
@@ -275,15 +303,19 @@ impl KvService for Node {
                 return;
             }
             let (index, _term) = result.unwrap();
-            for _ in 0..100 {
-                std::thread::sleep(Duration::from_millis(100));
-                let server = server.lock().unwrap();
-                let mut indexes = server.indexes.lock().unwrap();
-                if !indexes.contains_key(&index) {
-                    continue;
-                }
-                let cmd_applied = indexes.get_mut(&index).take().unwrap();
-                if cmd == *cmd_applied {
+            let cmd_chs = server.lock().unwrap().cmd_chs.clone();
+            if cmd_chs.lock().unwrap().contains_key(&index) {
+                let _ = sender.send(Ok(wrong_leader));
+                return;
+            }
+            let rx = {
+                let mut cmd_chs = cmd_chs.lock().unwrap();
+                let (tx, rx) = oneshot::channel();
+                cmd_chs.insert(index, tx);
+                rx
+            };
+            if let Some(cmd_applied) = recv_with_timeout(rx) {
+                if cmd == cmd_applied {
                     let _ = sender.send(Ok(reply_ok));
                     return;
                 } else {
@@ -291,16 +323,33 @@ impl KvService for Node {
                     return;
                 }
             }
-
             let reply = PutAppendReply {
                 err: "Timeout".to_owned(),
                 wrong_leader: false,
             };
+            warn!("PutAppend timeout !!!!!!!!!!!!!!!!!!!!");
             let _ = sender.send(Ok(reply));
         });
         Box::new(rx.then(|reply| match reply {
             Ok(Ok(reply)) => Ok(reply),
             _ => Err(labrpc::Error::Timeout),
         }))
+    }
+}
+
+fn recv_with_timeout(rx: oneshot::Receiver<Command>) -> Option<Command> {
+    if let Ok((cmd_applied, _)) = rx
+        .map_err(|_| ())
+        .map(Some)
+        .select(
+            futures_timer::Delay::new(Duration::from_secs(10))
+                .map_err(|_| ())
+                .map(|_| None),
+        )
+        .wait()
+    {
+        cmd_applied
+    } else {
+        None
     }
 }
