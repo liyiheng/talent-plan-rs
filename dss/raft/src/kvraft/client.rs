@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-const ERR_RETRY_DUR: Duration = Duration::from_millis(100);
+const ERR_RETRY_DUR: Duration = Duration::from_millis(200);
 
 enum Op {
     Put(String, String),
@@ -64,6 +64,7 @@ impl Clerk {
                     if v.wrong_leader {
                         let leader = (leader + 1) % server_cnt;
                         self.leader_id.store(leader, Ordering::Release);
+                        std::thread::sleep(ERR_RETRY_DUR);
                         continue;
                     } else if v.err.is_empty() {
                         return v.value;
@@ -116,6 +117,7 @@ impl Clerk {
                             "Client {}, put_append {}, wrong_leader, next {}",
                             self.name, req.key, leader
                         );
+                        std::thread::sleep(ERR_RETRY_DUR);
                         continue;
                     } else {
                         break;

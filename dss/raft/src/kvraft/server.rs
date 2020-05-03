@@ -274,22 +274,21 @@ impl KvService for Node {
             err: String::default(),
             wrong_leader: false,
         };
+        if !self.is_leader() {
+            return Box::new(futures::future::ok(wrong_leader));
+        }
 
         let server = self.server.clone();
         let cmd = Command::from(arg);
         let (sender, rx) = oneshot::channel();
         // TODO thread pool
         std::thread::spawn(move || {
-            if !server.lock().unwrap().rf.is_leader() {
-                let _ = sender.send(Ok(wrong_leader));
-                return;
-            }
-
             let result = server.lock().unwrap().rf.start(&cmd);
             if let Err(e) = result {
                 if let Error::NotLeader = e {
                     let _ = sender.send(Ok(wrong_leader));
                 } else {
+                    warn!("{:?} , {}", cmd, e);
                     let _ = sender.send(Err(e));
                 }
                 return;
