@@ -116,6 +116,30 @@ impl KvServer {
         });
         server
     }
+
+    // Start a command, and check raft state size if needed, if the size touched
+    // the limitation, create a snapshot
+    fn start(&self, cmd: &Command) -> Result<(u64, u64), raft::errors::Error> {
+        let result = self.rf.start(cmd);
+        if let Some(max_size) = self.maxraftstate {
+            if max_size < self.rf.get_persist_size() {
+                let data = self.data.read().unwrap();
+                let mut cmds = Vec::with_capacity(data.len());
+                for (k, v) in data.iter() {
+                    // TODO duplicate reqeusts checking
+                    cmds.push(Command {
+                        op: 1,
+                        key: k.clone(),
+                        value: Some(v.clone()),
+                        req_id: 0,
+                        client: "TODO".to_owned(),
+                    });
+                }
+                self.rf.snapshot(cmds)?;
+            }
+        }
+        result
+    }
 }
 
 impl KvServer {
@@ -193,7 +217,7 @@ impl KvService for Node {
         // But used a new thread and  the `wait()` method of a future,
         // it's a bad idea, but very easy.
         std::thread::spawn(move || {
-            let result = server.lock().unwrap().rf.start(&cmd);
+            let result = server.lock().unwrap().start(&cmd);
             if let Err(e) = result {
                 if let Error::NotLeader = e {
                     let _ = sender.send(Ok(wrong_leader));
@@ -273,7 +297,7 @@ impl KvService for Node {
         let cmd = Command::from(arg);
         let (sender, rx) = oneshot::channel();
         std::thread::spawn(move || {
-            let result = server.lock().unwrap().rf.start(&cmd);
+            let result = server.lock().unwrap().start(&cmd);
             if let Err(e) = result {
                 if let Error::NotLeader = e {
                     let _ = sender.send(Ok(wrong_leader));
