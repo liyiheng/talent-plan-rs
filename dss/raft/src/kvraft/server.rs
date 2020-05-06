@@ -89,6 +89,7 @@ impl KvServer {
                     // Ignore executed reqeusts
                     if req_id.is_none() || *req_id.unwrap() < cmd.req_id {
                         inner.last_reqs.insert(cmd.client.clone(), cmd.req_id);
+
                         // 1. put 2. append 3. get
                         match cmd.op {
                             1 => {

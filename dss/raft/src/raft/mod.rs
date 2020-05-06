@@ -458,6 +458,16 @@ impl Raft {
         } else {
             let first_index = self.persistent_state.first_index;
             if first_index > index as u64 {
+                if self.snapshot.uncommited.is_empty() {
+                    return None;
+                }
+                let last_i = self.snapshot.last_index as usize;
+                // Distance to the tail of uncommited logs
+                let offset = last_i - index;
+                let l = self.snapshot.uncommited.len();
+                if l > offset {
+                    return self.snapshot.uncommited.get(l - offset - 1);
+                }
                 return None;
             }
             self.persistent_state.log.get(index - first_index as usize)
@@ -716,6 +726,7 @@ impl Raft {
         while self.commit_index > self.last_applied {
             if self.last_applied > 0
                 && self.last_applied < self.persistent_state.first_index as usize
+                && !self.snapshot.states.is_empty()
             {
                 // Apply snapshot
                 for l in self.snapshot.states.iter() {
