@@ -17,7 +17,6 @@ pub struct KvServer {
     me: usize,
     // snapshot if log grows this big
     maxraftstate: Option<usize>,
-    // Your definitions here.
     inner: Arc<Mutex<ServerData>>,
 }
 
@@ -96,15 +95,11 @@ impl KvServer {
                                 inner.data.insert(cmd.key, cmd.value.unwrap());
                             }
                             2 => {
-                                if inner.data.contains_key(&cmd.key) {
-                                    inner
-                                        .data
-                                        .get_mut(&cmd.key)
-                                        .unwrap()
-                                        .push_str(&cmd.value.unwrap_or_default());
-                                } else {
-                                    inner.data.insert(cmd.key, cmd.value.unwrap());
-                                }
+                                inner
+                                    .data
+                                    .entry(cmd.key)
+                                    .or_default()
+                                    .push_str(&cmd.value.unwrap_or_default());
                             }
                             3 => {}
                             _ => {}
