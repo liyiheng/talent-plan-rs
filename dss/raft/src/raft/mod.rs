@@ -621,7 +621,6 @@ impl Raft {
                 term: self.state.term,
                 data,
             };
-            // TODO BUG: install_snapshot again and again
             let last_included_index = snapshot_args.last_included_index as usize;
             peer.spawn({
                 peer.install_snapshot(&snapshot_args)
@@ -723,9 +722,6 @@ impl Raft {
                     });
                 }
                 self.last_applied = self.snapshot.last_index as usize;
-                error!("apply snapshot");
-                // TODO bug, dead loop
-                continue;
             }
 
             self.last_applied += 1;
@@ -737,10 +733,14 @@ impl Raft {
                 "apply log, t:{}, i:{}, peer {}, is_leader:{}",
                 t, self.last_applied, self.me, self.state.is_leader,
             );
+            let log = self.get_log(self.last_applied);
+            if log.is_none() {
+                break;
+            }
             let _ = self.apply_ch.unbounded_send(ApplyMsg {
                 command_valid: true,
                 command_index: self.last_applied as u64,
-                command: self.get_log(self.last_applied).unwrap().data.clone(),
+                command: log.unwrap().data.clone(),
             });
         }
         // Heartbeat
