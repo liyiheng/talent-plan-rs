@@ -144,10 +144,7 @@ impl Raft {
         let mut snapshot_dat = vec![];
         labcodec::encode(&self.persistent_state, &mut data).unwrap();
         labcodec::encode(&self.snapshot, &mut snapshot_dat).unwrap();
-        self.persist_dat_size = 0;
-        for e in self.persistent_state.log.iter() {
-            self.persist_dat_size += e.data.len();
-        }
+        self.persist_dat_size = data.len();
         self.persister.save_state_and_snapshot(data, snapshot_dat);
     }
 
@@ -160,10 +157,7 @@ impl Raft {
         } else {
             self.persistent_state.first_index = 1;
         }
-        self.persist_dat_size = 0;
-        for e in self.persistent_state.log.iter() {
-            self.persist_dat_size += e.data.len();
-        }
+        self.persist_dat_size = data.len();
         let snapshot_dat = self.persister.snapshot();
         if !snapshot_dat.is_empty() {
             let snapshot = labcodec::decode(&snapshot_dat).unwrap();
@@ -340,6 +334,10 @@ impl Raft {
             }
             Event::AppendEntriesResult(peer, index, reply) => {
                 if reply.success {
+                    // raft::tests::test_figure_8_unreliable_2c
+                    // if self.leader_state.match_index[peer] > index {
+                    //     return;
+                    // }
                     self.leader_state.match_index[peer] = index;
                     self.leader_state.next_index[peer] = index + 1;
                 } else if reply.term > self.state.term {
@@ -454,7 +452,11 @@ impl Raft {
         if index == 0 {
             None
         } else {
-            self.persistent_state.log.get(index - 1)
+            let first_index = self.persistent_state.first_index;
+            if first_index > index as u64 {
+                return None;
+            }
+            self.persistent_state.log.get(index - first_index as usize)
         }
     }
     fn set_log(&mut self, index: usize, l: LogEntry) {
@@ -493,7 +495,7 @@ impl Raft {
             .log
             .last()
             .map(|l| l.term)
-            .unwrap_or(0);
+            .unwrap_or(self.snapshot.last_term);
         // §5.4.1  Raft determines which of two logs is more up-to-date
         // by comparing the index and term of the last entries in the
         // logs. If the logs have last entries with different terms, then
@@ -605,7 +607,6 @@ impl Raft {
         let peer = &self.peers[i];
         let i_next = self.leader_state.next_index[i];
         let next = self.last_log_index() as usize + 1;
-        let i_next = i_next.min(next);
         // If i_next < first_index, install_snapshot
         if i_next != next
             && i_next < self.persistent_state.first_index as usize
@@ -621,10 +622,6 @@ impl Raft {
                 data,
             };
             // TODO BUG: install_snapshot again and again
-            error!(
-                "install_snapshot leader:{}, peer:{}, last_i:{}, last_t:{}",
-                self.me, i, snapshot_args.last_included_index, snapshot_args.last_included_term
-            );
             let last_included_index = snapshot_args.last_included_index as usize;
             peer.spawn({
                 peer.install_snapshot(&snapshot_args)
@@ -705,12 +702,14 @@ impl Raft {
 
     fn step(&mut self) {
         let last_i = self.last_log_index();
-        let last_t = self.get_log(last_i).map(|t| t.term).unwrap_or(0);
+        let last_t = self
+            .get_log(last_i)
+            .map(|t| t.term)
+            .unwrap_or(self.snapshot.last_term);
         info!(
             "Interval {}, is_leader:{}, term:{}, last_log_term:{}, last_log_index:{}",
             self.me, self.state.is_leader, self.state.term, last_t, last_i
         );
-
         while self.commit_index > self.last_applied {
             if self.last_applied > 0
                 && self.last_applied < self.persistent_state.first_index as usize
@@ -724,6 +723,8 @@ impl Raft {
                     });
                 }
                 self.last_applied = self.snapshot.last_index as usize;
+                error!("apply snapshot");
+                // TODO bug, dead loop
                 continue;
             }
 
@@ -810,6 +811,7 @@ pub struct Node {
     raft: Arc<Mutex<Raft>>,
 }
 
+#[derive(Debug)]
 enum Event {
     RequestVote(RequestVoteArgs, oneshot::Sender<Reply>),
     AppendEntries(AppendEntriesArgs, oneshot::Sender<Reply>),
@@ -822,7 +824,7 @@ enum Event {
     StartElection,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum Reply {
     RequestVote(RequestVoteReply),
     AppendEntries(AppendEntriesReply),
