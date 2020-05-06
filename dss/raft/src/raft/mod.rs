@@ -65,9 +65,11 @@ struct PersistentState {
 struct SnapshotState {
     #[prost(message, repeated, tag = "1")]
     states: Vec<LogEntry>,
-    #[prost(uint64, tag = "2")]
-    last_index: u64,
+    #[prost(message, repeated, tag = "2")]
+    uncommited: Vec<LogEntry>,
     #[prost(uint64, tag = "3")]
+    last_index: u64,
+    #[prost(uint64, tag = "4")]
     last_term: u64,
 }
 
@@ -235,7 +237,7 @@ impl Raft {
         Ok((index as u64, term))
     }
 
-    fn snapshot<M>(&mut self, cmds: Vec<M>) -> Result<()>
+    fn snapshot<M>(&mut self, cmds: Vec<M>, last_commit: u64) -> Result<()>
     where
         M: labcodec::Message,
     {
@@ -260,10 +262,12 @@ impl Raft {
             .unwrap_or_default();
         self.snapshot.last_index = self.last_log_index() as u64;
         self.snapshot.states = logs;
-
+        self.snapshot.uncommited.clear();
+        let i = last_commit + 1 - self.persistent_state.first_index;
+        let mut uncommited = self.persistent_state.log.split_off(i as usize);
+        self.snapshot.uncommited.append(&mut uncommited);
         self.persistent_state.first_index = self.snapshot.last_index + 1;
         self.persistent_state.log.clear();
-
         self.persist();
         Ok(())
     }
@@ -898,11 +902,11 @@ impl Node {
 
     /// Create a snapshot and clear all logs in persistent_state
     /// cmds are current states of the server.
-    pub fn snapshot<M>(&self, cmds: Vec<M>) -> Result<()>
+    pub fn snapshot<M>(&self, cmds: Vec<M>, last_commit: u64) -> Result<()>
     where
         M: labcodec::Message,
     {
-        self.raft.lock().unwrap().snapshot(cmds)
+        self.raft.lock().unwrap().snapshot(cmds, last_commit)
     }
 
     /// The current term of this peer.

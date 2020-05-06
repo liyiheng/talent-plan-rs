@@ -3,7 +3,6 @@ use crate::raft;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::RwLock;
 use std::time::Duration;
 
 use crate::raft::errors::Error;
@@ -19,9 +18,17 @@ pub struct KvServer {
     // snapshot if log grows this big
     maxraftstate: Option<usize>,
     // Your definitions here.
-    data: Arc<RwLock<HashMap<String, String>>>,
-    cmd_chs: Arc<Mutex<HashMap<u64, oneshot::Sender<Command>>>>,
-    last_reqs: Arc<Mutex<HashMap<String, u64>>>,
+    inner: Arc<Mutex<ServerData>>,
+}
+
+// ServerData warps fields of a KvServer that needed to be
+// shared between threads
+#[derive(Default)]
+struct ServerData {
+    last_commit: u64,
+    data: HashMap<String, String>,
+    cmd_chs: HashMap<u64, oneshot::Sender<Command>>,
+    last_reqs: HashMap<String, u64>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -61,16 +68,12 @@ impl KvServer {
         let rf = raft::Raft::new(servers, me, persister, tx);
         let rf = raft::Node::new(rf);
         let server = KvServer {
+            inner: Arc::default(),
             rf,
             me,
             maxraftstate,
-            data: Arc::default(),
-            cmd_chs: Arc::default(),
-            last_reqs: Arc::default(),
         };
-        let data = server.data.clone();
-        let last_reqs = server.last_reqs.clone();
-        let cmd_chs = server.cmd_chs.clone();
+        let inner = server.inner.clone();
         // Spawn a new thread to receive applied commands
         std::thread::spawn(move || {
             let _ = apply_ch
@@ -80,33 +83,34 @@ impl KvServer {
                     (cmd, msg.command_index)
                 })
                 .for_each(|(cmd, index)| {
+                    let mut inner = inner.lock().unwrap();
+                    inner.last_commit = index;
                     let cmd2 = cmd.clone();
-                    let mut req_ids_mutex = last_reqs.lock().unwrap();
-                    let mut data = data.write().unwrap();
-                    let req_id = req_ids_mutex.get(&cmd.client);
+                    let req_id = inner.last_reqs.get(&cmd.client);
                     // Ignore executed reqeusts
                     if req_id.is_none() || *req_id.unwrap() < cmd.req_id {
-                        req_ids_mutex.insert(cmd.client.clone(), cmd.req_id);
+                        inner.last_reqs.insert(cmd.client.clone(), cmd.req_id);
                         // 1. put 2. append 3. get
                         match cmd.op {
                             1 => {
-                                data.insert(cmd.key, cmd.value.unwrap());
+                                inner.data.insert(cmd.key, cmd.value.unwrap());
                             }
                             2 => {
-                                if data.contains_key(&cmd.key) {
-                                    data.get_mut(&cmd.key)
+                                if inner.data.contains_key(&cmd.key) {
+                                    inner
+                                        .data
+                                        .get_mut(&cmd.key)
                                         .unwrap()
                                         .push_str(&cmd.value.unwrap_or_default());
                                 } else {
-                                    data.insert(cmd.key, cmd.value.unwrap());
+                                    inner.data.insert(cmd.key, cmd.value.unwrap());
                                 }
                             }
                             3 => {}
                             _ => {}
                         }
                     }
-                    let mut cmd_chs = cmd_chs.lock().unwrap();
-                    if let Some(tx) = cmd_chs.remove(&index) {
+                    if let Some(tx) = inner.cmd_chs.remove(&index) {
                         let _ = tx.send(cmd2);
                     }
                     Ok(())
@@ -123,9 +127,9 @@ impl KvServer {
         let result = self.rf.start(cmd);
         if let Some(max_size) = self.maxraftstate {
             if max_size < self.rf.get_persist_size() {
-                let data = self.data.read().unwrap();
-                let mut cmds = Vec::with_capacity(data.len());
-                for (k, v) in data.iter() {
+                let inner = self.inner.lock().unwrap();
+                let mut cmds = Vec::with_capacity(inner.data.len());
+                for (k, v) in inner.data.iter() {
                     // TODO duplicate reqeusts checking
                     cmds.push(Command {
                         op: 1,
@@ -135,7 +139,7 @@ impl KvServer {
                         client: "TODO".to_owned(),
                     });
                 }
-                self.rf.snapshot(cmds)?;
+                self.rf.snapshot(cmds, inner.last_commit)?;
             }
         }
         result
@@ -230,17 +234,16 @@ impl KvService for Node {
 
             // If there is a sender for 'index' already,
             // it was put by another request
-            let cmd_chs = server.lock().unwrap().cmd_chs.clone();
-            if cmd_chs.lock().unwrap().contains_key(&index) {
+            let inner = server.lock().unwrap().inner.clone();
+            if inner.lock().unwrap().cmd_chs.contains_key(&index) {
                 let _ = sender.send(Ok(wrong_leader));
                 return;
             }
 
             // Create a channel to wait the command be applied
             let rx = {
-                let mut cmd_chs = cmd_chs.lock().unwrap();
                 let (tx, rx) = oneshot::channel();
-                cmd_chs.insert(index, tx);
+                inner.lock().unwrap().cmd_chs.insert(index, tx);
                 rx
             };
 
@@ -248,12 +251,10 @@ impl KvService for Node {
                 // cmd_applied is same with cmd means this server is the leader,
                 // and the command was commited.
                 if cmd == cmd_applied {
-                    let v = server
+                    let v = inner
                         .lock()
                         .unwrap()
                         .data
-                        .read()
-                        .unwrap()
                         .get(&cmd.key)
                         .cloned()
                         .unwrap_or_default();
@@ -307,15 +308,14 @@ impl KvService for Node {
                 return;
             }
             let (index, _term) = result.unwrap();
-            let cmd_chs = server.lock().unwrap().cmd_chs.clone();
-            if cmd_chs.lock().unwrap().contains_key(&index) {
+            let inner = server.lock().unwrap().inner.clone();
+            if inner.lock().unwrap().cmd_chs.contains_key(&index) {
                 let _ = sender.send(Ok(wrong_leader));
                 return;
             }
             let rx = {
-                let mut cmd_chs = cmd_chs.lock().unwrap();
                 let (tx, rx) = oneshot::channel();
-                cmd_chs.insert(index, tx);
+                inner.lock().unwrap().cmd_chs.insert(index, tx);
                 rx
             };
             if let Some(cmd_applied) = recv_with_timeout(rx) {
