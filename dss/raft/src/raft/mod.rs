@@ -437,7 +437,9 @@ impl Raft {
         }
         if last_i < self.last_log_index() {
             // TODO out of bounds
-            self.persistent_state.log.split_off(last_i);
+            self.persistent_state
+                .log
+                .split_off(last_i + 1 - self.persistent_state.first_index as usize);
         }
         // 5. If leaderCommit > commitIndex, set commitIndex =
         // min(leaderCommit, index of last new entry)
@@ -532,8 +534,8 @@ impl Raft {
         };
         if !is_up_to_date {
             info!(
-                "{} refused {}, log not up-to-date",
-                self.me, args.candidate_id
+                "{} refused {}, log not up-to-date, last_i:{},last_t:{}, arg.last_i:{}, arg.last_t:{}",
+                self.me, args.candidate_id, last_log_index, last_log_term, args.last_log_index, args.last_log_term
             );
             return resp;
         }
@@ -559,11 +561,9 @@ impl Raft {
         self.persistent_state.voted_for = Some(self.me as u64);
         self.persist();
         let last_term = self
-            .persistent_state
-            .log
-            .last()
+            .get_log(self.last_log_index())
             .map(|l| l.term)
-            .unwrap_or(0);
+            .unwrap_or(self.snapshot.last_term);
         let args = RequestVoteArgs {
             candidate_id: self.me as u64,
             last_log_index: self.last_log_index() as u64,
@@ -746,12 +746,25 @@ impl Raft {
             self.last_applied
         );
         while self.commit_index > self.last_applied {
-            if self.last_applied > 0
-                && self.last_applied < self.persistent_state.first_index as usize
+            if self.last_applied < self.persistent_state.first_index as usize
                 && !self.snapshot.states.is_empty()
             {
-                // Apply snapshot
-                for l in self.snapshot.states.iter() {
+                let last_commited =
+                    self.snapshot.last_index as usize - self.snapshot.uncommited.len();
+                if self.last_applied < last_commited {
+                    // Apply snapshot
+                    for l in self.snapshot.states.iter() {
+                        let _ = self.apply_ch.unbounded_send(ApplyMsg {
+                            command_valid: true,
+                            command_index: self.last_applied as u64,
+                            command: l.data.clone(),
+                        });
+                    }
+                    self.last_applied = last_commited
+                }
+                while self.get_log(self.last_applied + 1).is_some() {
+                    self.last_applied += 1;
+                    let l = self.get_log(self.last_applied).unwrap();
                     let _ = self.apply_ch.unbounded_send(ApplyMsg {
                         command_valid: true,
                         command_index: self.last_applied as u64,
@@ -776,6 +789,14 @@ impl Raft {
                 self.me,
                 self.state.is_leader,
             );
+            if t == 0 {
+                warn!(
+                    "len:{}, snapshot.uncommited:{}, snapshot:{}",
+                    self.persistent_state.log.len(),
+                    self.snapshot.uncommited.len(),
+                    self.snapshot.states.len()
+                );
+            }
             let log = self.get_log(self.last_applied + 1);
             if log.is_none() {
                 break;
