@@ -269,6 +269,9 @@ impl Raft {
         self.persistent_state.first_index = self.snapshot.last_index + 1;
         self.persistent_state.log.clear();
         self.persist();
+        for i in 0..self.peers.len() {
+            self.install_snapshot_to(i);
+        }
         Ok(())
     }
 
@@ -388,6 +391,7 @@ impl Raft {
         if prev_i > 0 {
             let prev_t = args.prev_log_term;
             let t = if prev_i == self.snapshot.last_index as usize {
+                // TODO
                 Some(self.snapshot.last_term)
             } else {
                 self.get_log(prev_i).map(|l| l.term)
@@ -411,7 +415,11 @@ impl Raft {
                 }
                 return resp;
             }
+        } else {
+            // prev_i is 0, discard the snapshot
+            self.snapshot = SnapshotState::default();
         }
+
         // 3. If an existing entry conflicts with a new one (same index
         // but different terms), delete the existing entry and all that
         // follow it (§5.3)
@@ -428,6 +436,7 @@ impl Raft {
             }
         }
         if last_i < self.last_log_index() {
+            // TODO out of bounds
             self.persistent_state.log.split_off(last_i);
         }
         // 5. If leaderCommit > commitIndex, set commitIndex =
@@ -445,10 +454,8 @@ impl Raft {
     }
 
     fn update_state(&mut self, is_leader: bool, term: u64) {
-        let s = self.state.clone();
         self.state = Arc::new(State { is_leader, term });
         self.persistent_state.current_term = term;
-        info!("State of {}, {:?} => {:?}", self.me, s, self.state);
     }
 
     // index starts from 1
@@ -605,6 +612,38 @@ impl Raft {
         self.peers[self.me].spawn(fut);
     }
 
+    fn install_snapshot_to(&self, i: usize) {
+        if i == self.me {
+            return;
+        }
+        let peer = &self.peers[i];
+        let event_sender = self.event_ch.clone().unwrap();
+        let mut data = vec![];
+        labcodec::encode(&self.snapshot, &mut data).unwrap();
+        let snapshot_args = InstallSnapshotArgs {
+            leader_id: self.me as u64,
+            last_included_index: self.snapshot.last_index,
+            last_included_term: self.snapshot.last_term,
+            term: self.state.term,
+            data,
+        };
+        let last_included_index = snapshot_args.last_included_index as usize;
+        peer.spawn({
+            peer.install_snapshot(&snapshot_args)
+                .map_err(Error::Rpc)
+                .then(move |reply| {
+                    if let Ok(reply) = reply {
+                        let _ = event_sender.unbounded_send(Event::InstallSnapshotResult(
+                            i,
+                            last_included_index,
+                            reply,
+                        ));
+                    }
+                    Ok(())
+                })
+        });
+    }
+
     fn append_entries_to(&mut self, i: usize) {
         let index = self.last_log_index() as usize;
         let event_sender = self.event_ch.clone().unwrap();
@@ -626,30 +665,7 @@ impl Raft {
             && i_next < self.persistent_state.first_index as usize
             && self.snapshot.last_index > 0
         {
-            let mut data = vec![];
-            labcodec::encode(&self.snapshot, &mut data).unwrap();
-            let snapshot_args = InstallSnapshotArgs {
-                leader_id: self.me as u64,
-                last_included_index: self.snapshot.last_index,
-                last_included_term: self.snapshot.last_term,
-                term: self.state.term,
-                data,
-            };
-            let last_included_index = snapshot_args.last_included_index as usize;
-            peer.spawn({
-                peer.install_snapshot(&snapshot_args)
-                    .map_err(Error::Rpc)
-                    .then(move |reply| {
-                        if let Ok(reply) = reply {
-                            let _ = event_sender.unbounded_send(Event::InstallSnapshotResult(
-                                i,
-                                last_included_index,
-                                reply,
-                            ));
-                        }
-                        Ok(())
-                    })
-            });
+            self.install_snapshot_to(i);
             return;
         }
         let entries = if i_next == next {
@@ -720,8 +736,14 @@ impl Raft {
             .map(|t| t.term)
             .unwrap_or(self.snapshot.last_term);
         info!(
-            "Interval {}, is_leader:{}, term:{}, last_log_term:{}, last_log_index:{}",
-            self.me, self.state.is_leader, self.state.term, last_t, last_i
+            "Interval {},leader:{},term:{},last_log_t:{},last_log_i:{},commit_i:{},last_applied:{}",
+            self.me,
+            self.state.is_leader,
+            self.state.term,
+            last_t,
+            last_i,
+            self.commit_index,
+            self.last_applied
         );
         while self.commit_index > self.last_applied {
             if self.last_applied > 0
@@ -736,27 +758,34 @@ impl Raft {
                         command: l.data.clone(),
                     });
                 }
+                info!(
+                    "apply snapshot, i:{}, peer {}, is_leader:{}, snapshot_last_i:{}",
+                    self.last_applied, self.me, self.state.is_leader, self.snapshot.last_index
+                );
                 self.last_applied = self.snapshot.last_index as usize;
             }
 
-            self.last_applied += 1;
             let t = self
-                .get_log(self.last_applied)
+                .get_log(self.last_applied + 1)
                 .map(|l| l.term)
                 .unwrap_or_default();
             info!(
                 "apply log, t:{}, i:{}, peer {}, is_leader:{}",
-                t, self.last_applied, self.me, self.state.is_leader,
+                t,
+                self.last_applied + 1,
+                self.me,
+                self.state.is_leader,
             );
-            let log = self.get_log(self.last_applied);
+            let log = self.get_log(self.last_applied + 1);
             if log.is_none() {
                 break;
             }
             let _ = self.apply_ch.unbounded_send(ApplyMsg {
                 command_valid: true,
-                command_index: self.last_applied as u64,
+                command_index: self.last_applied as u64 + 1,
                 command: log.unwrap().data.clone(),
             });
+            self.last_applied += 1;
         }
         // Heartbeat
         if self.state.is_leader() {

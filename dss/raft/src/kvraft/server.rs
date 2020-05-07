@@ -338,7 +338,7 @@ fn recv_with_timeout(rx: oneshot::Receiver<Command>) -> Option<Command> {
         .map_err(|_| ())
         .map(Some)
         .select(
-            futures_timer::Delay::new(Duration::from_secs(10))
+            futures_timer::Delay::new(Duration::from_secs(5))
                 .map_err(|_| ())
                 .map(|_| None),
         )
