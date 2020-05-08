@@ -8,6 +8,7 @@ use std::time::Duration;
 use crate::raft::errors::Error;
 use futures::prelude::*;
 use futures::sync::mpsc::unbounded;
+use futures::sync::mpsc::UnboundedSender;
 use futures::sync::oneshot;
 use futures::Stream;
 use labrpc::RpcFuture;
@@ -26,7 +27,7 @@ pub struct KvServer {
 struct ServerData {
     last_commit: u64,
     data: HashMap<String, String>,
-    cmd_chs: HashMap<u64, oneshot::Sender<Command>>,
+    cmd_chs: HashMap<u64, oneshot::Sender<(Command, String)>>,
     last_reqs: HashMap<String, u64>,
 }
 
@@ -106,8 +107,9 @@ impl KvServer {
                             _ => {}
                         }
                     }
+                    let value = inner.data.get(&cmd2.key).cloned().unwrap_or_default();
                     if let Some(tx) = inner.cmd_chs.remove(&index) {
-                        let _ = tx.send(cmd2);
+                        let _ = tx.send((cmd2, value));
                     }
                     Ok(())
                 })
@@ -140,6 +142,161 @@ impl KvServer {
         }
         result
     }
+
+    fn handle_event(&self, event: Event) {
+        match event {
+            Event::PutAppend(arg, sender) => {
+                self.handle_put_append(arg, sender);
+            }
+            Event::Get(arg, sender) => {
+                self.handle_get(arg, sender);
+            }
+            Event::Shutdown => unreachable!(),
+        }
+    }
+    fn handle_get(&self, arg: GetRequest, sender: oneshot::Sender<GetReply>) {
+        let GetRequest {
+            key,
+            client,
+            req_id,
+        } = arg;
+        let cmd = Command {
+            op: 3,
+            key,
+            value: None,
+            client,
+            req_id,
+        };
+
+        let wrong_leader = GetReply {
+            err: String::new(),
+            value: String::new(),
+            wrong_leader: true,
+        };
+        if !self.rf.is_leader() {
+            let _ = sender.send(wrong_leader);
+            return;
+        }
+
+        let result = self.start(&cmd);
+        if let Err(e) = result {
+            if let Error::NotLeader = e {
+                let _ = sender.send(wrong_leader);
+            } else {
+                let _ = sender.send(GetReply {
+                    err: e.to_string(),
+                    value: "".to_owned(),
+                    wrong_leader: false,
+                });
+            }
+            return;
+        }
+        let (index, _) = result.unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        if inner.cmd_chs.contains_key(&index) {
+            let _ = sender.send(wrong_leader);
+            return;
+        }
+        // Create a channel to wait the command be applied
+        let rx = {
+            let (tx, rx) = oneshot::channel();
+            inner.cmd_chs.insert(index, tx);
+            rx
+        };
+        std::thread::spawn(move || {
+            let _ = rx
+                .select2(futures_timer::Delay::new(Duration::from_secs(5)))
+                .and_then(move |either| {
+                    match either {
+                        futures::future::Either::A(((cmd_applied, value), _)) => {
+                            let r = GetReply {
+                                value,
+                                err: "".to_owned(),
+                                wrong_leader: false,
+                            };
+                            if cmd_applied == cmd {
+                                let _ = sender.send(r);
+                            } else {
+                                let _ = sender.send(wrong_leader);
+                            }
+                        }
+                        futures::future::Either::B(_) => {
+                            let _ = sender.send(GetReply {
+                                err: "Timeout ".to_owned(),
+                                value: "".to_owned(),
+                                wrong_leader: false,
+                            });
+                        }
+                    };
+                    Ok(())
+                })
+                .wait();
+        });
+    }
+
+    fn handle_put_append(&self, arg: PutAppendRequest, sender: oneshot::Sender<PutAppendReply>) {
+        let wrong_leader = PutAppendReply {
+            err: "Wrong leader".to_owned(),
+            wrong_leader: true,
+        };
+        let reply_ok = PutAppendReply {
+            err: String::default(),
+            wrong_leader: false,
+        };
+        if !self.rf.is_leader() {
+            let _ = sender.send(wrong_leader);
+            return;
+        }
+        let cmd = Command::from(arg);
+        let result = self.start(&cmd);
+        if let Err(e) = result {
+            if let Error::NotLeader = e {
+                let _ = sender.send(wrong_leader);
+            } else {
+                let _ = sender.send(PutAppendReply {
+                    err: e.to_string(),
+                    wrong_leader: false,
+                });
+            }
+            return;
+        }
+        let (index, _term) = result.unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        if inner.cmd_chs.contains_key(&index) {
+            // Already a sender there
+            let _ = sender.send(wrong_leader);
+            return;
+        }
+        let rx = {
+            let (tx, rx) = oneshot::channel();
+            inner.cmd_chs.insert(index, tx);
+            rx
+        };
+        // An ugly but easy implementation
+        std::thread::spawn(move || {
+            let _ = rx
+                .select2(futures_timer::Delay::new(Duration::from_secs(5)))
+                .and_then(move |either| {
+                    match either {
+                        futures::future::Either::A(((cmd_applied, _), _)) => {
+                            if cmd_applied == cmd {
+                                let _ = sender.send(reply_ok);
+                            } else {
+                                let _ = sender.send(wrong_leader);
+                            }
+                        }
+                        futures::future::Either::B(_) => {
+                            let _ = sender.send(PutAppendReply {
+                                err: "Timeout ".to_owned(),
+                                wrong_leader: false,
+                            });
+                        }
+                    };
+                    Ok(())
+                })
+                .wait();
+        });
+    }
 }
 
 impl KvServer {
@@ -155,12 +312,41 @@ impl KvServer {
 #[derive(Clone)]
 pub struct Node {
     server: Arc<Mutex<KvServer>>,
+    event_sender: UnboundedSender<Event>,
+}
+
+// Node communicate with KvServer through Event and
+// a channel
+enum Event {
+    Shutdown,
+    PutAppend(PutAppendRequest, oneshot::Sender<PutAppendReply>),
+    Get(GetRequest, oneshot::Sender<GetReply>),
 }
 
 impl Node {
     pub fn new(kv: KvServer) -> Node {
         let server = Arc::new(Mutex::new(kv));
-        Node { server }
+        let (tx, rx) = unbounded();
+        let node = Node {
+            server: server.clone(),
+            event_sender: tx,
+        };
+        std::thread::spawn(move || {
+            rx.take_while(|e| {
+                if let Event::Shutdown = e {
+                    Ok(false)
+                } else {
+                    Ok(true)
+                }
+            })
+            .for_each(|event| {
+                server.lock().unwrap().handle_event(event);
+                Ok(())
+            })
+            .wait()
+            .unwrap();
+        });
+        node
     }
 
     /// the tester calls Kill() when a KVServer instance won't
@@ -168,7 +354,7 @@ impl Node {
     /// in Kill(), but it might be convenient to (for example)
     /// turn off debug output from this instance.
     pub fn kill(&self) {
-        self.server.lock().unwrap().rf.kill();
+        let _ = self.event_sender.unbounded_send(Event::Shutdown);
     }
 
     /// The current term of this peer.
@@ -187,165 +373,23 @@ impl Node {
 }
 
 impl KvService for Node {
-    // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
+    // Send args and a sender to KvServer, return the receiver as a RpcFuture
     fn get(&self, arg: GetRequest) -> RpcFuture<GetReply> {
-        let GetRequest {
-            key,
-            client,
-            req_id,
-        } = arg;
-        let cmd = Command {
-            op: 3,
-            key,
-            value: None,
-            client,
-            req_id,
-        };
-        let wrong_leader = GetReply {
-            err: String::new(),
-            value: String::new(),
-            wrong_leader: true,
-        };
-        if !self.is_leader() {
-            return Box::new(futures::future::ok(wrong_leader));
-        }
-
-        let server = self.server.clone();
-        let (sender, rx) = oneshot::channel();
-
-        // Should use combinators of futures here.
-        // But used a new thread and  the `wait()` method of a future,
-        // it's a bad idea, but very easy.
-        std::thread::spawn(move || {
-            let result = server.lock().unwrap().start(&cmd);
-            if let Err(e) = result {
-                if let Error::NotLeader = e {
-                    let _ = sender.send(Ok(wrong_leader));
-                } else {
-                    let _ = sender.send(Err(e));
-                }
-                return;
-            }
-            let (index, _) = result.unwrap();
-
-            // If there is a sender for 'index' already,
-            // it was put by another request
-            let inner = server.lock().unwrap().inner.clone();
-            if inner.lock().unwrap().cmd_chs.contains_key(&index) {
-                let _ = sender.send(Ok(wrong_leader));
-                return;
-            }
-
-            // Create a channel to wait the command be applied
-            let rx = {
-                let (tx, rx) = oneshot::channel();
-                inner.lock().unwrap().cmd_chs.insert(index, tx);
-                rx
-            };
-
-            if let Some(cmd_applied) = recv_with_timeout(rx) {
-                // cmd_applied is same with cmd means this server is the leader,
-                // and the command was commited.
-                if cmd == cmd_applied {
-                    let v = inner
-                        .lock()
-                        .unwrap()
-                        .data
-                        .get(&cmd.key)
-                        .cloned()
-                        .unwrap_or_default();
-                    let reply_ok = GetReply {
-                        wrong_leader: false,
-                        value: v,
-                        err: "".to_owned(),
-                    };
-                    let _ = sender.send(Ok(reply_ok));
-                    return;
-                } else {
-                    let _ = sender.send(Ok(wrong_leader));
-                    return;
-                }
-            }
-            let err = Err(raft::errors::Error::Rpc(labrpc::Error::Timeout));
-            let _ = sender.send(err);
-        });
-        Box::new(rx.then(|reply| match reply {
-            Ok(Ok(reply)) => Ok(reply),
-            Ok(Err(e)) => Err(labrpc::Error::Other(e.to_string())),
+        let (a, b) = oneshot::channel();
+        let _ = self.event_sender.unbounded_send(Event::Get(arg, a));
+        Box::new(b.then(|reply| match reply {
+            Ok(reply) => Ok(reply),
             Err(e) => Err(labrpc::Error::Other(e.to_string())),
         }))
     }
 
-    // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
+    // Send args and a sender to KvServer, return the receiver as a RpcFuture
     fn put_append(&self, arg: PutAppendRequest) -> RpcFuture<PutAppendReply> {
-        let wrong_leader = PutAppendReply {
-            err: "Wrong leader".to_owned(),
-            wrong_leader: true,
-        };
-        let reply_ok = PutAppendReply {
-            err: String::default(),
-            wrong_leader: false,
-        };
-        if !self.is_leader() {
-            return Box::new(futures::future::ok(wrong_leader));
-        }
-
-        let server = self.server.clone();
-        let cmd = Command::from(arg);
-        let (sender, rx) = oneshot::channel();
-        std::thread::spawn(move || {
-            let result = server.lock().unwrap().start(&cmd);
-            if let Err(e) = result {
-                if let Error::NotLeader = e {
-                    let _ = sender.send(Ok(wrong_leader));
-                } else {
-                    let _ = sender.send(Err(e));
-                }
-                return;
-            }
-            let (index, _term) = result.unwrap();
-            let inner = server.lock().unwrap().inner.clone();
-            if inner.lock().unwrap().cmd_chs.contains_key(&index) {
-                let _ = sender.send(Ok(wrong_leader));
-                return;
-            }
-            let rx = {
-                let (tx, rx) = oneshot::channel();
-                inner.lock().unwrap().cmd_chs.insert(index, tx);
-                rx
-            };
-            if let Some(cmd_applied) = recv_with_timeout(rx) {
-                if cmd == cmd_applied {
-                    let _ = sender.send(Ok(reply_ok));
-                    return;
-                } else {
-                    let _ = sender.send(Ok(wrong_leader));
-                    return;
-                }
-            }
-            let err = Err(raft::errors::Error::Rpc(labrpc::Error::Timeout));
-            let _ = sender.send(err);
-        });
-        Box::new(rx.then(|reply| match reply {
-            Ok(Ok(reply)) => Ok(reply),
-            _ => Err(labrpc::Error::Timeout),
+        let (a, b) = oneshot::channel();
+        let _ = self.event_sender.unbounded_send(Event::PutAppend(arg, a));
+        Box::new(b.then(|reply| match reply {
+            Ok(reply) => Ok(reply),
+            Err(e) => Err(labrpc::Error::Other(e.to_string())),
         }))
-    }
-}
-
-fn recv_with_timeout(rx: oneshot::Receiver<Command>) -> Option<Command> {
-    if let Ok((cmd_applied, _)) = rx
-        .map_err(|_| ())
-        .map(Some)
-        .select(
-            futures_timer::Delay::new(Duration::from_secs(5))
-                .map_err(|_| ())
-                .map(|_| None),
-        )
-        .wait()
-    {
-        cmd_applied
-    } else {
-        None
     }
 }

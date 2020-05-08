@@ -97,6 +97,7 @@ pub struct Raft {
     commit_index: usize,
     last_applied: usize,
     timeout_at: Instant,
+    last_hb: Instant,
     persistent_state: PersistentState,
     persist_dat_size: usize,
     snapshot: SnapshotState,
@@ -128,6 +129,7 @@ impl Raft {
             commit_index: 0,
             last_applied: 0,
             timeout_at: Instant::now(),
+            last_hb: Instant::now(),
             persistent_state: PersistentState::default(),
             persist_dat_size: 0,
             snapshot: SnapshotState::default(),
@@ -279,6 +281,7 @@ impl Raft {
         for i in 0..self.peers.len() {
             self.append_entries_to(i);
         }
+        self.last_hb = Instant::now();
     }
 }
 
@@ -830,8 +833,9 @@ impl Raft {
                     }
                 }
             }
-            self.send_heartbeat();
-            return;
+            if self.last_hb.elapsed() >= INTERVAL_PERIOD {
+                self.send_heartbeat();
+            }
         }
     }
 }
