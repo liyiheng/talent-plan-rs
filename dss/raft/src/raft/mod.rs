@@ -742,11 +742,11 @@ impl Raft {
         }
         self.update_state(is_leader, term);
         self.persistent_state.voted_for = None;
-        // if is_leader && self.last_log_index() > 0 {
-        //     self.persistent_state
-        //         .log
-        //         .push(LogEntry { term, data: vec![] });
-        // }
+        if is_leader && self.last_log_index() > 0 {
+            self.persistent_state
+                .log
+                .push(LogEntry { term, data: vec![] });
+        }
         self.persist();
         if is_leader {
             let log_size = self.last_log_index();
@@ -758,22 +758,7 @@ impl Raft {
         }
     }
 
-    fn step(&mut self) {
-        let last_i = self.last_log_index();
-        let last_t = self
-            .get_log(last_i)
-            .map(|t| t.term)
-            .unwrap_or(self.snapshot.last_term);
-        info!(
-            "Interval {},leader:{},term:{},last_log_t:{},last_log_i:{},commit_i:{},last_applied:{}",
-            self.me,
-            self.state.is_leader,
-            self.state.term,
-            last_t,
-            last_i,
-            self.commit_index,
-            self.last_applied
-        );
+    fn try_commit(&mut self) {
         while self.commit_index > self.last_applied {
             if self.last_applied < self.persistent_state.first_index as usize
                 && !self.snapshot.states.is_empty()
@@ -837,31 +822,50 @@ impl Raft {
             });
             self.last_applied += 1;
         }
-        // Heartbeat
-        if self.state.is_leader() {
-            // If there exists an N such that N > commitIndex, a majority
-            // of matchIndex[i] ≥ N, and log[N].term == currentTerm:
-            // set commitIndex = N (§5.3, §5.4).
-            let max_match = *self.leader_state.match_index.iter().max().unwrap();
-            let majority = self.peers.len() / 2;
-            if max_match > self.commit_index {
-                for n in (self.commit_index + 1..=max_match).rev() {
-                    let c = self
-                        .leader_state
-                        .match_index
-                        .iter()
-                        .filter(|v| **v >= n)
-                        .count();
-                    let log_term = self.get_log(n).map(|l| l.term).unwrap_or_default();
-                    if c > majority && log_term == self.state.term {
-                        self.commit_index = n;
-                        break;
-                    }
+    }
+
+    fn step(&mut self) {
+        let last_i = self.last_log_index();
+        let last_t = self
+            .get_log(last_i)
+            .map(|t| t.term)
+            .unwrap_or(self.snapshot.last_term);
+        info!(
+            "Interval {},leader:{},term:{},last_log_t:{},last_log_i:{},commit_i:{},last_applied:{}",
+            self.me,
+            self.state.is_leader,
+            self.state.term,
+            last_t,
+            last_i,
+            self.commit_index,
+            self.last_applied
+        );
+        if !self.state.is_leader() {
+            return;
+        }
+        // If there exists an N such that N > commitIndex, a majority
+        // of matchIndex[i] ≥ N, and log[N].term == currentTerm:
+        // set commitIndex = N (§5.3, §5.4).
+        let prev_commit_i = self.commit_index;
+        let max_match = *self.leader_state.match_index.iter().max().unwrap();
+        let majority = self.peers.len() / 2;
+        if max_match > self.commit_index {
+            for n in (self.commit_index + 1..=max_match).rev() {
+                let c = self
+                    .leader_state
+                    .match_index
+                    .iter()
+                    .filter(|v| **v >= n)
+                    .count();
+                let log_term = self.get_log(n).map(|l| l.term).unwrap_or_default();
+                if c > majority && log_term == self.state.term {
+                    self.commit_index = n;
+                    break;
                 }
             }
-            if self.last_hb.elapsed() >= INTERVAL_PERIOD {
-                self.send_heartbeat();
-            }
+        }
+        if self.last_hb.elapsed() >= INTERVAL_PERIOD || prev_commit_i != self.commit_index {
+            self.send_heartbeat();
         }
     }
 }
@@ -951,11 +955,13 @@ impl Node {
                     future::ok(has_next)
                 })
                 .for_each(|event| {
+                    let mut rf = raft.lock().unwrap();
                     if let Some(event) = event {
-                        raft.lock().unwrap().handle_event(event);
+                        rf.handle_event(event);
                     } else {
-                        raft.lock().unwrap().step();
+                        rf.step();
                     }
+                    rf.try_commit();
                     Ok(())
                 })
                 .wait()
