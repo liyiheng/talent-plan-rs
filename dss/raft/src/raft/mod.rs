@@ -438,12 +438,16 @@ impl Raft {
                 self.set_log(i + 1, entry);
             }
         }
-        if last_i < self.last_log_index() {
-            // TODO out of bounds
-            self.persistent_state
-                .log
-                .split_off(last_i + 1 - self.persistent_state.first_index as usize);
+        while last_i < self.last_log_index() {
+            self.pop_log();
         }
+        // if last_i < self.last_log_index() {
+        //     // TODO out of bounds
+        //     self.persistent_state
+        //         .log
+        //         .split_off(last_i + 1 - self.persistent_state.first_index as usize);
+        // }
+
         // 5. If leaderCommit > commitIndex, set commitIndex =
         // min(leaderCommit, index of last new entry)
         if args.leader_commit > self.commit_index as u64 {
@@ -556,6 +560,23 @@ impl Raft {
 
     fn last_log_index(&self) -> usize {
         self.persistent_state.first_index as usize + self.persistent_state.log.len() - 1
+    }
+
+    fn pop_log(&mut self) {
+        if !self.persistent_state.log.is_empty() {
+            self.persistent_state.log.pop();
+        } else if !self.snapshot.uncommited.is_empty() {
+            self.snapshot.uncommited.pop();
+            self.snapshot.last_index -= 1;
+            self.persistent_state.first_index -= 1;
+            // TODO last committed term
+            self.snapshot.last_term = self
+                .snapshot
+                .uncommited
+                .last()
+                .map(|l| l.term)
+                .unwrap_or_default();
+        }
     }
 
     fn start_election(&mut self) {
@@ -721,6 +742,11 @@ impl Raft {
         }
         self.update_state(is_leader, term);
         self.persistent_state.voted_for = None;
+        // if is_leader && self.last_log_index() > 0 {
+        //     self.persistent_state
+        //         .log
+        //         .push(LogEntry { term, data: vec![] });
+        // }
         self.persist();
         if is_leader {
             let log_size = self.last_log_index();
