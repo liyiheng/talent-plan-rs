@@ -663,7 +663,9 @@ impl Raft {
                     } else {
                         // TODO delay
                         error!("{} failed to install_snapshot_to {}", me, i);
-                        let _ = event_sender.unbounded_send(Event::InstallSnapshotErr(i));
+                        if i > 1000 {
+                            let _ = event_sender.unbounded_send(Event::InstallSnapshotErr(i));
+                        }
                     }
                     Ok(())
                 })
