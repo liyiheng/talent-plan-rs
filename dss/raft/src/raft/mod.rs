@@ -342,6 +342,9 @@ impl Raft {
                     }
                 }
             }
+            Event::InstallSnapshotErr(peer_id) => {
+                self.install_snapshot_to(peer_id);
+            }
             Event::AppendEntriesResult(peer, index, reply) => {
                 if reply.success {
                     // raft::tests::test_figure_8_unreliable_2c
@@ -441,12 +444,6 @@ impl Raft {
         while last_i < self.last_log_index() {
             self.pop_log();
         }
-        // if last_i < self.last_log_index() {
-        //     // TODO out of bounds
-        //     self.persistent_state
-        //         .log
-        //         .split_off(last_i + 1 - self.persistent_state.first_index as usize);
-        // }
 
         // 5. If leaderCommit > commitIndex, set commitIndex =
         // min(leaderCommit, index of last new entry)
@@ -652,6 +649,7 @@ impl Raft {
             data,
         };
         let last_included_index = snapshot_args.last_included_index as usize;
+        let me = self.me;
         peer.spawn({
             peer.install_snapshot(&snapshot_args)
                 .map_err(Error::Rpc)
@@ -662,6 +660,10 @@ impl Raft {
                             last_included_index,
                             reply,
                         ));
+                    } else {
+                        // TODO delay
+                        error!("{} failed to install_snapshot_to {}", me, i);
+                        let _ = event_sender.unbounded_send(Event::InstallSnapshotErr(i));
                     }
                     Ok(())
                 })
@@ -760,6 +762,7 @@ impl Raft {
 
     fn try_commit(&mut self) {
         while self.commit_index > self.last_applied {
+            // TODO
             if self.last_applied < self.persistent_state.first_index as usize
                 && !self.snapshot.states.is_empty()
             {
@@ -825,21 +828,21 @@ impl Raft {
     }
 
     fn step(&mut self) {
-        let last_i = self.last_log_index();
-        let last_t = self
-            .get_log(last_i)
-            .map(|t| t.term)
-            .unwrap_or(self.snapshot.last_term);
-        info!(
-            "Interval {},leader:{},term:{},last_log_t:{},last_log_i:{},commit_i:{},last_applied:{}",
-            self.me,
-            self.state.is_leader,
-            self.state.term,
-            last_t,
-            last_i,
-            self.commit_index,
-            self.last_applied
-        );
+        // let last_i = self.last_log_index();
+        // let last_t = self
+        //     .get_log(last_i)
+        //     .map(|t| t.term)
+        //     .unwrap_or(self.snapshot.last_term);
+        // info!(
+        //     "Interval {},leader:{},term:{},last_log_t:{},last_log_i:{},commit_i:{},last_applied:{}",
+        //     self.me,
+        //     self.state.is_leader,
+        //     self.state.term,
+        //     last_t,
+        //     last_i,
+        //     self.commit_index,
+        //     self.last_applied
+        // );
         if !self.state.is_leader() {
             return;
         }
@@ -919,6 +922,8 @@ enum Event {
     AppendEntriesResult(usize, usize, AppendEntriesReply),
     // peer_id, index, reply
     InstallSnapshotResult(usize, usize, InstallSnapshotReply),
+    // peer_id
+    InstallSnapshotErr(usize),
     Shutdown,
     StartElection,
 }
@@ -1057,19 +1062,19 @@ impl RaftService for Node {
     }
 
     fn append_entries(&self, args: AppendEntriesArgs) -> RpcFuture<AppendEntriesReply> {
-        {
-            let rf = self.raft.lock().unwrap();
-            info!(
-                "append_entries {}:{} got {}:{}, term:{},prev_term:{},entries:{}",
-                rf.me,
-                rf.state.term,
-                args.leader_id,
-                args.term,
-                args.term,
-                args.prev_log_term,
-                args.entries.len()
-            );
-        }
+        // {
+        //     let rf = self.raft.lock().unwrap();
+        //     info!(
+        //         "append_entries {}:{} got {}:{}, term:{},prev_term:{},entries:{}",
+        //         rf.me,
+        //         rf.state.term,
+        //         args.leader_id,
+        //         args.term,
+        //         args.term,
+        //         args.prev_log_term,
+        //         args.entries.len()
+        //     );
+        // }
         let (tx, rx) = oneshot::channel();
         let result = self
             .sender
