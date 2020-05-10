@@ -139,6 +139,8 @@ impl KvServer {
         }
         // Spawn a new thread to receive applied commands
         std::thread::spawn(move || {
+            // TODO apply_ch.select(event_ch)
+            // TODO fix snapshot_rpc_3b, linearizability
             let _ = apply_ch
                 .filter(|msg| {
                     if !msg.command_valid {
