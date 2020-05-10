@@ -399,20 +399,11 @@ impl Raft {
         // but different terms), delete the existing entry and all that
         // follow it (§5.3)
         // 4. Append any new entries not already in the log
-        let last_i = prev_i + args.entries.len();
-        for (j, entry) in args.entries.into_iter().enumerate() {
-            let t = entry.term;
-            // i is index of Vec, it's 'index - 1'
-            let i = prev_i + j;
-            if i >= self.last_log_index() {
-                self.persistent_state.log.push(entry);
-            } else if self.get_log(i + 1).unwrap().term != t {
-                self.set_log(i + 1, entry);
-            }
-        }
-        while last_i < self.last_log_index() {
-            self.persistent_state.log.pop();
-        }
+        let start_pos = prev_i - self.persistent_state.last_included_index as usize;
+        self.persistent_state.log.drain(start_pos..);
+        self.persistent_state
+            .log
+            .extend(args.entries.iter().cloned());
 
         // 5. If leaderCommit > commitIndex, set commitIndex =
         // min(leaderCommit, index of last new entry)
@@ -446,12 +437,6 @@ impl Raft {
         }
         let vec_index = index - last_included as usize - 1;
         self.persistent_state.log.get(vec_index)
-    }
-    fn set_log(&mut self, index: usize, l: LogEntry) {
-        if index == 0 || index > self.persistent_state.log.len() {
-            return;
-        }
-        self.persistent_state.log[index - 1] = l;
     }
 
     fn handle_vote_request(&mut self, args: RequestVoteArgs) -> RequestVoteReply {
@@ -892,7 +877,12 @@ impl Node {
                         rf.handle_event(event);
                     } else {
                         rf.step();
-                        info!("Peer {}, is_leader:{}", rf.me, rf.state.is_leader);
+                        info!(
+                            "Peer {}, is_leader:{}, last_log_index:{}",
+                            rf.me,
+                            rf.state.is_leader,
+                            rf.last_log_index()
+                        );
                     }
                     rf.try_commit();
                     Ok(())
