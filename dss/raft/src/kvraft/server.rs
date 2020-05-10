@@ -5,12 +5,15 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::proto::raftpb::RaftClient;
 use crate::raft::errors::Error;
+use futures::future;
 use futures::prelude::*;
 use futures::sync::mpsc::unbounded;
 use futures::sync::mpsc::UnboundedSender;
 use futures::sync::oneshot;
 use futures::Stream;
+use futures_timer::Delay;
 use labrpc::RpcFuture;
 
 pub struct KvServer {
@@ -21,14 +24,69 @@ pub struct KvServer {
     inner: Arc<Mutex<ServerData>>,
 }
 
-// ServerData warps fields of a KvServer that needed to be
-// shared between threads
+/// Snapshot contains applied states and request ids of each client
+#[derive(Clone, PartialEq, Message)]
+struct Snapshot {
+    #[prost(string, repeated, tag = "1")]
+    keys: Vec<String>,
+    #[prost(string, repeated, tag = "2")]
+    values: Vec<String>,
+    #[prost(string, repeated, tag = "3")]
+    clients: Vec<String>,
+    #[prost(uint64, repeated, tag = "4")]
+    req_ids: Vec<u64>,
+}
+
+/// ServerData warps fields of a KvServer that needed to be
+/// shared between threads
 #[derive(Default)]
 struct ServerData {
     last_commit: u64,
     data: HashMap<String, String>,
     cmd_chs: HashMap<u64, oneshot::Sender<(Command, String)>>,
     last_reqs: HashMap<String, u64>,
+}
+
+impl ServerData {
+    // Create Snapshot with data needed
+    fn dump_snapshot(&self) -> Snapshot {
+        let data_len = self.data.len();
+        let mut keys = Vec::with_capacity(data_len);
+        let mut values = Vec::with_capacity(data_len);
+        for (k, v) in self.data.iter() {
+            keys.push(k.clone());
+            values.push(v.clone());
+        }
+        let n_clients = self.last_reqs.len();
+        let mut clients = Vec::with_capacity(n_clients);
+        let mut req_ids = Vec::with_capacity(n_clients);
+        for (k, v) in self.last_reqs.iter() {
+            clients.push(k.clone());
+            req_ids.push(*v);
+        }
+        Snapshot {
+            keys,
+            values,
+            clients,
+            req_ids,
+        }
+    }
+
+    // apply the snapshot to states
+    fn apply_snapshot(&mut self, snapshot: Snapshot) {
+        let Snapshot {
+            keys,
+            values,
+            clients,
+            req_ids,
+        } = snapshot;
+        for (k, v) in keys.into_iter().zip(values.into_iter()) {
+            self.data.insert(k, v);
+        }
+        for (k, v) in clients.into_iter().zip(req_ids.into_iter()) {
+            self.last_reqs.insert(k, v);
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -59,26 +117,41 @@ impl From<PutAppendRequest> for Command {
 
 impl KvServer {
     pub fn new(
-        servers: Vec<crate::proto::raftpb::RaftClient>,
+        servers: Vec<RaftClient>,
         me: usize,
         persister: Box<dyn raft::persister::Persister>,
         maxraftstate: Option<usize>,
     ) -> KvServer {
+        let snapshot_data = persister.snapshot();
         let (tx, apply_ch) = unbounded();
         let rf = raft::Raft::new(servers, me, persister, tx);
         let rf = raft::Node::new(rf);
         let server = KvServer {
             inner: Arc::default(),
-            rf,
+            rf: rf.clone(),
             me,
             maxraftstate,
         };
         let inner = server.inner.clone();
+        if !snapshot_data.is_empty() {
+            let snapshot = labcodec::decode(&snapshot_data).unwrap();
+            inner.lock().unwrap().apply_snapshot(snapshot);
+        }
         // Spawn a new thread to receive applied commands
         std::thread::spawn(move || {
             let _ = apply_ch
-                .filter(|msg| msg.command_valid)
+                .filter(|msg| {
+                    if !msg.command_valid {
+                        if let Ok(snapshot) = labcodec::decode(&msg.command) {
+                            inner.lock().unwrap().apply_snapshot(snapshot);
+                        } else {
+                            error!("Failed to decode snapshot");
+                        }
+                    }
+                    msg.command_valid
+                })
                 .map(|msg| {
+                    assert_ne!(0, msg.command.len(), "Empty data of {}", msg.command_index);
                     let cmd: Command = labcodec::decode(&msg.command).unwrap();
                     (cmd, msg.command_index)
                 })
@@ -111,6 +184,16 @@ impl KvServer {
                     if let Some(tx) = inner.cmd_chs.remove(&index) {
                         let _ = tx.send((cmd2, value));
                     }
+                    if let Some(max_size) = maxraftstate {
+                        if max_size * 9 / 10 < rf.get_persist_size() {
+                            let snapshot = inner.dump_snapshot();
+                            let mut data = vec![];
+                            if let Ok(()) = labcodec::encode(&snapshot, &mut data) {
+                                let _ = rf.snapshot(data, inner.last_commit);
+                            }
+                        }
+                    }
+
                     Ok(())
                 })
                 .wait();
@@ -119,30 +202,7 @@ impl KvServer {
         server
     }
 
-    // Start a command, and check raft state size if needed, if the size touched
-    // the limitation, create a snapshot
-    fn start(&self, cmd: &Command) -> Result<(u64, u64), raft::errors::Error> {
-        let result = self.rf.start(cmd);
-        if let Some(max_size) = self.maxraftstate {
-            if max_size < self.rf.get_persist_size() {
-                let inner = self.inner.lock().unwrap();
-                let mut cmds = Vec::with_capacity(inner.data.len());
-                for (k, v) in inner.data.iter() {
-                    // TODO duplicate reqeusts checking
-                    cmds.push(Command {
-                        op: 1,
-                        key: k.clone(),
-                        value: Some(v.clone()),
-                        req_id: 0,
-                        client: "TODO".to_owned(),
-                    });
-                }
-                self.rf.snapshot(cmds, inner.last_commit)?;
-            }
-        }
-        result
-    }
-
+    /// Dispatch events
     fn handle_event(&self, event: Event) {
         match event {
             Event::PutAppend(arg, sender) => {
@@ -154,6 +214,7 @@ impl KvServer {
             Event::Shutdown => unreachable!(),
         }
     }
+
     fn handle_get(&self, arg: GetRequest, sender: oneshot::Sender<GetReply>) {
         let GetRequest {
             key,
@@ -178,7 +239,7 @@ impl KvServer {
             return;
         }
 
-        let result = self.start(&cmd);
+        let result = self.rf.start(&cmd);
         if let Err(e) = result {
             if let Error::NotLeader = e {
                 let _ = sender.send(wrong_leader);
@@ -205,10 +266,10 @@ impl KvServer {
         };
         std::thread::spawn(move || {
             let _ = rx
-                .select2(futures_timer::Delay::new(Duration::from_secs(5)))
+                .select2(Delay::new(Duration::from_secs(5)))
                 .and_then(move |either| {
                     match either {
-                        futures::future::Either::A(((cmd_applied, value), _)) => {
+                        future::Either::A(((cmd_applied, value), _)) => {
                             let r = GetReply {
                                 value,
                                 err: "".to_owned(),
@@ -220,7 +281,7 @@ impl KvServer {
                                 let _ = sender.send(wrong_leader);
                             }
                         }
-                        futures::future::Either::B(_) => {
+                        future::Either::B(_) => {
                             let _ = sender.send(GetReply {
                                 err: "Timeout ".to_owned(),
                                 value: "".to_owned(),
@@ -248,7 +309,7 @@ impl KvServer {
             return;
         }
         let cmd = Command::from(arg);
-        let result = self.start(&cmd);
+        let result = self.rf.start(&cmd);
         if let Err(e) = result {
             if let Error::NotLeader = e {
                 let _ = sender.send(wrong_leader);
@@ -262,11 +323,6 @@ impl KvServer {
         }
         let (index, _term) = result.unwrap();
         let mut inner = self.inner.lock().unwrap();
-        if inner.cmd_chs.contains_key(&index) {
-            // Already a sender there
-            let _ = sender.send(wrong_leader);
-            return;
-        }
         let rx = {
             let (tx, rx) = oneshot::channel();
             inner.cmd_chs.insert(index, tx);
@@ -275,17 +331,17 @@ impl KvServer {
         // An ugly but easy implementation
         std::thread::spawn(move || {
             let _ = rx
-                .select2(futures_timer::Delay::new(Duration::from_secs(5)))
+                .select2(Delay::new(Duration::from_secs(5)))
                 .and_then(move |either| {
                     match either {
-                        futures::future::Either::A(((cmd_applied, _), _)) => {
+                        future::Either::A(((cmd_applied, _), _)) => {
                             if cmd_applied == cmd {
                                 let _ = sender.send(reply_ok);
                             } else {
                                 let _ = sender.send(wrong_leader);
                             }
                         }
-                        futures::future::Either::B(_) => {
+                        future::Either::B(_) => {
                             let _ = sender.send(PutAppendReply {
                                 err: "Timeout ".to_owned(),
                                 wrong_leader: false,
@@ -334,6 +390,7 @@ impl Node {
         std::thread::spawn(move || {
             rx.take_while(|e| {
                 if let Event::Shutdown = e {
+                    server.lock().unwrap().rf.kill();
                     Ok(false)
                 } else {
                     Ok(true)
@@ -375,9 +432,11 @@ impl Node {
 impl KvService for Node {
     // Send args and a sender to KvServer, return the receiver as a RpcFuture
     fn get(&self, arg: GetRequest) -> RpcFuture<GetReply> {
-        let (a, b) = oneshot::channel();
-        let _ = self.event_sender.unbounded_send(Event::Get(arg, a));
-        Box::new(b.then(|reply| match reply {
+        let (tx, rx) = oneshot::channel();
+        if let Err(e) = self.event_sender.unbounded_send(Event::Get(arg, tx)) {
+            return Box::new(future::err(labrpc::Error::Other(e.to_string())));
+        }
+        Box::new(rx.then(|reply| match reply {
             Ok(reply) => Ok(reply),
             Err(e) => Err(labrpc::Error::Other(e.to_string())),
         }))
@@ -385,9 +444,11 @@ impl KvService for Node {
 
     // Send args and a sender to KvServer, return the receiver as a RpcFuture
     fn put_append(&self, arg: PutAppendRequest) -> RpcFuture<PutAppendReply> {
-        let (a, b) = oneshot::channel();
-        let _ = self.event_sender.unbounded_send(Event::PutAppend(arg, a));
-        Box::new(b.then(|reply| match reply {
+        let (tx, rx) = oneshot::channel();
+        if let Err(e) = self.event_sender.unbounded_send(Event::PutAppend(arg, tx)) {
+            return Box::new(future::err(labrpc::Error::Other(e.to_string())));
+        }
+        Box::new(rx.then(|reply| match reply {
             Ok(reply) => Ok(reply),
             Err(e) => Err(labrpc::Error::Other(e.to_string())),
         }))
