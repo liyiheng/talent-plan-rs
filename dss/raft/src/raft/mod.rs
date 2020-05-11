@@ -865,6 +865,7 @@ impl Node {
                 .take_while(|event| {
                     let has_next = if let Some(Event::Shutdown) = event {
                         info!("Peer {} shutdown", raft.lock().unwrap().me);
+                        raft.lock().unwrap().persist();
                         false
                     } else {
                         true
