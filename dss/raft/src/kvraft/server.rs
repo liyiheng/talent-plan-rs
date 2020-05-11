@@ -1,15 +1,15 @@
 use crate::proto::kvraftpb::*;
 use crate::raft;
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::proto::raftpb::RaftClient;
 use crate::raft::errors::Error;
+use crate::raft::ApplyMsg;
 use futures::future;
 use futures::prelude::*;
 use futures::sync::mpsc::unbounded;
+use futures::sync::mpsc::UnboundedReceiver;
 use futures::sync::mpsc::UnboundedSender;
 use futures::sync::oneshot;
 use futures::Stream;
@@ -21,7 +21,11 @@ pub struct KvServer {
     me: usize,
     // snapshot if log grows this big
     maxraftstate: Option<usize>,
-    inner: Arc<Mutex<ServerData>>,
+    last_applied: u64,
+    data: HashMap<String, String>,
+    cmd_chs: HashMap<u64, oneshot::Sender<(Command, String)>>,
+    last_reqs: HashMap<String, u64>,
+    apply_ch: Option<UnboundedReceiver<ApplyMsg>>,
 }
 
 /// Snapshot contains applied states and request ids of each client
@@ -35,58 +39,6 @@ struct Snapshot {
     clients: Vec<String>,
     #[prost(uint64, repeated, tag = "4")]
     req_ids: Vec<u64>,
-}
-
-/// ServerData warps fields of a KvServer that needed to be
-/// shared between threads
-#[derive(Default)]
-struct ServerData {
-    last_commit: u64,
-    data: HashMap<String, String>,
-    cmd_chs: HashMap<u64, oneshot::Sender<(Command, String)>>,
-    last_reqs: HashMap<String, u64>,
-}
-
-impl ServerData {
-    // Create Snapshot with data needed
-    fn dump_snapshot(&self) -> Snapshot {
-        let data_len = self.data.len();
-        let mut keys = Vec::with_capacity(data_len);
-        let mut values = Vec::with_capacity(data_len);
-        for (k, v) in self.data.iter() {
-            keys.push(k.clone());
-            values.push(v.clone());
-        }
-        let n_clients = self.last_reqs.len();
-        let mut clients = Vec::with_capacity(n_clients);
-        let mut req_ids = Vec::with_capacity(n_clients);
-        for (k, v) in self.last_reqs.iter() {
-            clients.push(k.clone());
-            req_ids.push(*v);
-        }
-        Snapshot {
-            keys,
-            values,
-            clients,
-            req_ids,
-        }
-    }
-
-    // apply the snapshot to states
-    fn apply_snapshot(&mut self, snapshot: Snapshot) {
-        let Snapshot {
-            keys,
-            values,
-            clients,
-            req_ids,
-        } = snapshot;
-        for (k, v) in keys.into_iter().zip(values.into_iter()) {
-            self.data.insert(k, v);
-        }
-        for (k, v) in clients.into_iter().zip(req_ids.into_iter()) {
-            self.last_reqs.insert(k, v);
-        }
-    }
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -126,86 +78,65 @@ impl KvServer {
         let (tx, apply_ch) = unbounded();
         let rf = raft::Raft::new(servers, me, persister, tx);
         let rf = raft::Node::new(rf);
-        let server = KvServer {
-            inner: Arc::default(),
+        let mut server = KvServer {
+            last_applied: 0,
             rf: rf.clone(),
             me,
             maxraftstate,
+            apply_ch: Some(apply_ch),
+            cmd_chs: HashMap::default(),
+            last_reqs: HashMap::default(),
+            data: HashMap::default(),
         };
-        let inner = server.inner.clone();
         if !snapshot_data.is_empty() {
             let snapshot = labcodec::decode(&snapshot_data).unwrap();
-            inner.lock().unwrap().apply_snapshot(snapshot);
+            server.apply_snapshot(snapshot);
         }
-        // Spawn a new thread to receive applied commands
-        std::thread::spawn(move || {
-            // TODO apply_ch.select(event_ch)
-            // TODO fix snapshot_rpc_3b, linearizability
-            let _ = apply_ch
-                .filter(|msg| {
-                    if !msg.command_valid {
-                        if let Ok(snapshot) = labcodec::decode(&msg.command) {
-                            inner.lock().unwrap().apply_snapshot(snapshot);
-                        } else {
-                            error!("Failed to decode snapshot");
-                        }
-                    }
-                    msg.command_valid
-                })
-                .map(|msg| {
-                    assert_ne!(0, msg.command.len(), "Empty data of {}", msg.command_index);
-                    let cmd: Command = labcodec::decode(&msg.command).unwrap();
-                    (cmd, msg.command_index)
-                })
-                .for_each(|(cmd, index)| {
-                    let mut inner = inner.lock().unwrap();
-                    inner.last_commit = index;
-                    let cmd2 = cmd.clone();
-                    let req_id = inner.last_reqs.get(&cmd.client);
-                    // Ignore executed reqeusts
-                    if req_id.is_none() || *req_id.unwrap() < cmd.req_id {
-                        inner.last_reqs.insert(cmd.client.clone(), cmd.req_id);
-
-                        // 1. put 2. append 3. get
-                        match cmd.op {
-                            1 => {
-                                inner.data.insert(cmd.key, cmd.value.unwrap());
-                            }
-                            2 => {
-                                inner
-                                    .data
-                                    .entry(cmd.key)
-                                    .or_default()
-                                    .push_str(&cmd.value.unwrap_or_default());
-                            }
-                            3 => {}
-                            _ => {}
-                        }
-                    }
-                    let value = inner.data.get(&cmd2.key).cloned().unwrap_or_default();
-                    if let Some(tx) = inner.cmd_chs.remove(&index) {
-                        let _ = tx.send((cmd2, value));
-                    }
-                    if let Some(max_size) = maxraftstate {
-                        if max_size * 9 / 10 < rf.get_persist_size() {
-                            let snapshot = inner.dump_snapshot();
-                            let mut data = vec![];
-                            if let Ok(()) = labcodec::encode(&snapshot, &mut data) {
-                                let _ = rf.snapshot(data, inner.last_commit);
-                            }
-                        }
-                    }
-
-                    Ok(())
-                })
-                .wait();
-            warn!("apply_ch receiver finished");
-        });
         server
     }
 
+    // Create Snapshot with data needed
+    fn dump_snapshot(&self) -> Snapshot {
+        let data_len = self.data.len();
+        let mut keys = Vec::with_capacity(data_len);
+        let mut values = Vec::with_capacity(data_len);
+        for (k, v) in self.data.iter() {
+            keys.push(k.clone());
+            values.push(v.clone());
+        }
+        let n_clients = self.last_reqs.len();
+        let mut clients = Vec::with_capacity(n_clients);
+        let mut req_ids = Vec::with_capacity(n_clients);
+        for (k, v) in self.last_reqs.iter() {
+            clients.push(k.clone());
+            req_ids.push(*v);
+        }
+        Snapshot {
+            keys,
+            values,
+            clients,
+            req_ids,
+        }
+    }
+
+    // apply the snapshot to states
+    fn apply_snapshot(&mut self, snapshot: Snapshot) {
+        let Snapshot {
+            keys,
+            values,
+            clients,
+            req_ids,
+        } = snapshot;
+        for (k, v) in keys.into_iter().zip(values.into_iter()) {
+            self.data.insert(k, v);
+        }
+        for (k, v) in clients.into_iter().zip(req_ids.into_iter()) {
+            self.last_reqs.insert(k, v);
+        }
+    }
+
     /// Dispatch events
-    fn handle_event(&self, event: Event) {
+    fn handle_event(&mut self, event: Event) {
         match event {
             Event::PutAppend(arg, sender) => {
                 self.handle_put_append(arg, sender);
@@ -213,11 +144,63 @@ impl KvServer {
             Event::Get(arg, sender) => {
                 self.handle_get(arg, sender);
             }
+            Event::Apply(msg) => {
+                self.handle_apply_msg(msg);
+            }
+            Event::GetRaftState(sender) => {
+                let _ = sender.send(self.rf.get_state());
+            }
             Event::Shutdown => unreachable!(),
         }
     }
+    fn handle_apply_msg(&mut self, msg: ApplyMsg) {
+        if !msg.command_valid {
+            if let Ok(snapshot) = labcodec::decode(&msg.command) {
+                self.apply_snapshot(snapshot);
+            } else {
+                error!("Failed to decode snapshot");
+            }
+            return;
+        }
+        let cmd: Command = labcodec::decode(&msg.command).unwrap();
+        let index = msg.command_index;
+        self.last_applied = index;
+        let cmd2 = cmd.clone();
+        let req_id = self.last_reqs.get(&cmd.client);
+        // Ignore executed reqeusts
+        if req_id.is_none() || *req_id.unwrap() < cmd.req_id {
+            self.last_reqs.insert(cmd.client.clone(), cmd.req_id);
+            // 1. put 2. append 3. get
+            match cmd.op {
+                1 => {
+                    self.data.insert(cmd.key, cmd.value.unwrap());
+                }
+                2 => {
+                    self.data
+                        .entry(cmd.key)
+                        .or_default()
+                        .push_str(&cmd.value.unwrap_or_default());
+                }
+                3 => {}
+                _ => {}
+            }
+        }
+        let value = self.data.get(&cmd2.key).cloned().unwrap_or_default();
+        if let Some(tx) = self.cmd_chs.remove(&index) {
+            let _ = tx.send((cmd2, value));
+        }
+        if let Some(max_size) = self.maxraftstate {
+            if max_size * 9 / 10 < self.rf.get_persist_size() {
+                let snapshot = self.dump_snapshot();
+                let mut data = vec![];
+                if let Ok(()) = labcodec::encode(&snapshot, &mut data) {
+                    let _ = self.rf.snapshot(data, self.last_applied);
+                }
+            }
+        }
+    }
 
-    fn handle_get(&self, arg: GetRequest, sender: oneshot::Sender<GetReply>) {
+    fn handle_get(&mut self, arg: GetRequest, sender: oneshot::Sender<GetReply>) {
         let GetRequest {
             key,
             client,
@@ -255,20 +238,19 @@ impl KvServer {
             return;
         }
         let (index, _) = result.unwrap();
-        let mut inner = self.inner.lock().unwrap();
-        if inner.cmd_chs.contains_key(&index) {
+        if self.cmd_chs.contains_key(&index) {
             let _ = sender.send(wrong_leader);
             return;
         }
         // Create a channel to wait the command be applied
         let rx = {
             let (tx, rx) = oneshot::channel();
-            inner.cmd_chs.insert(index, tx);
+            self.cmd_chs.insert(index, tx);
             rx
         };
         std::thread::spawn(move || {
             let _ = rx
-                .select2(Delay::new(Duration::from_secs(5)))
+                .select2(Delay::new(Duration::from_secs(1)))
                 .and_then(move |either| {
                     match either {
                         future::Either::A(((cmd_applied, value), _)) => {
@@ -297,7 +279,11 @@ impl KvServer {
         });
     }
 
-    fn handle_put_append(&self, arg: PutAppendRequest, sender: oneshot::Sender<PutAppendReply>) {
+    fn handle_put_append(
+        &mut self,
+        arg: PutAppendRequest,
+        sender: oneshot::Sender<PutAppendReply>,
+    ) {
         let wrong_leader = PutAppendReply {
             err: "Wrong leader".to_owned(),
             wrong_leader: true,
@@ -324,16 +310,15 @@ impl KvServer {
             return;
         }
         let (index, _term) = result.unwrap();
-        let mut inner = self.inner.lock().unwrap();
         let rx = {
             let (tx, rx) = oneshot::channel();
-            inner.cmd_chs.insert(index, tx);
+            self.cmd_chs.insert(index, tx);
             rx
         };
         // An ugly but easy implementation
         std::thread::spawn(move || {
             let _ = rx
-                .select2(Delay::new(Duration::from_secs(5)))
+                .select2(Delay::new(Duration::from_secs(1)))
                 .and_then(move |either| {
                     match either {
                         future::Either::A(((cmd_applied, _), _)) => {
@@ -366,10 +351,9 @@ impl KvServer {
     }
 }
 
-// Use a lock here, an easy implementation
+// Node communicate with KvServer through a channel,
 #[derive(Clone)]
 pub struct Node {
-    server: Arc<Mutex<KvServer>>,
     event_sender: UnboundedSender<Event>,
 }
 
@@ -379,31 +363,34 @@ enum Event {
     Shutdown,
     PutAppend(PutAppendRequest, oneshot::Sender<PutAppendReply>),
     Get(GetRequest, oneshot::Sender<GetReply>),
+    Apply(ApplyMsg),
+    GetRaftState(oneshot::Sender<raft::State>),
 }
 
 impl Node {
-    pub fn new(kv: KvServer) -> Node {
-        let server = Arc::new(Mutex::new(kv));
+    pub fn new(mut kv: KvServer) -> Node {
+        let apply_ch = kv.apply_ch.take().unwrap();
         let (tx, rx) = unbounded();
-        let node = Node {
-            server: server.clone(),
-            event_sender: tx,
-        };
+        let node = Node { event_sender: tx };
         std::thread::spawn(move || {
-            rx.take_while(|e| {
-                if let Event::Shutdown = e {
-                    server.lock().unwrap().rf.kill();
-                    Ok(false)
-                } else {
-                    Ok(true)
-                }
-            })
-            .for_each(|event| {
-                server.lock().unwrap().handle_event(event);
-                Ok(())
-            })
-            .wait()
-            .unwrap();
+            let kv = std::cell::RefCell::new(kv);
+            let _ = apply_ch
+                .map(Event::Apply)
+                .select(rx)
+                .take_while(|e| {
+                    if let Event::Shutdown = e {
+                        kv.borrow().rf.kill();
+                        Ok(false)
+                    } else {
+                        Ok(true)
+                    }
+                })
+                .for_each(|event| {
+                    kv.borrow_mut().handle_event(event);
+                    Ok(())
+                })
+                .wait();
+            info!("Comsumer thread finished");
         });
         node
     }
@@ -427,7 +414,11 @@ impl Node {
     }
 
     pub fn get_state(&self) -> raft::State {
-        self.server.lock().unwrap().rf.get_state()
+        let (tx, rx) = oneshot::channel();
+        self.event_sender
+            .unbounded_send(Event::GetRaftState(tx))
+            .unwrap();
+        rx.wait().unwrap()
     }
 }
 
