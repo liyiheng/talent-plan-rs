@@ -292,7 +292,7 @@ impl Raft {
                     return;
                 }
                 self.reset_timer();
-                info!("{} start election", self.me);
+                debug!("{} start election", self.me);
                 self.start_election();
             }
             Event::VoteResult(term, cnt) => {
@@ -329,7 +329,7 @@ impl Raft {
                 } else if reply.term > self.state.term {
                     self.update_state(false, reply.term);
                     self.persist();
-                    info!(
+                    debug!(
                         "{} got higher term, not a leader now {}",
                         self.me, self.state.is_leader
                     );
@@ -341,7 +341,7 @@ impl Raft {
                     let old = self.leader_state.next_index[peer];
                     self.leader_state.next_index[peer] = last_i;
                     let ni = self.leader_state.next_index[peer];
-                    info!("Decrease next_index of {}: {}=>{}", peer, old, ni);
+                    debug!("Decrease next_index of {}: {}=>{}", peer, old, ni);
                     self.append_entries_to(peer);
                 }
             }
@@ -453,7 +453,7 @@ impl Raft {
             vote_granted: false,
         };
         if current_term > args.term {
-            info!(
+            debug!(
                 "{} refused {}, term: {}>{}",
                 self.me, args.candidate_id, current_term, args.term
             );
@@ -463,7 +463,7 @@ impl Raft {
         let voted_for = self.persistent_state.voted_for;
         if current_term == args.term && voted_for.is_some() && voted_for != Some(args.candidate_id)
         {
-            info!(
+            debug!(
                 "{} refused {}, voted for {:?}",
                 self.me, args.candidate_id, voted_for
             );
@@ -485,14 +485,14 @@ impl Raft {
             false
         };
         if !is_up_to_date {
-            info!(
+            debug!(
                 "{} refused {}, log not up-to-date, last_i:{},last_t:{}, arg.last_i:{}, arg.last_t:{}",
                 self.me, args.candidate_id, last_log_index, last_log_term, args.last_log_index, args.last_log_term
             );
             return resp;
         }
-        info!(
-            "[handle_vote_request] {} voted for {}",
+        debug!(
+            "handle_vote_request {} voted for {}",
             self.me, args.candidate_id,
         );
         self.reset_timer();
@@ -550,7 +550,7 @@ impl Raft {
                     let mut votes = 0;
                     let mut max_term = term;
                     for e in v {
-                        info!("Vote result of {}: {:?}", me, e);
+                        debug!("Vote result of {}: {:?}", me, e);
                         if let Ok(e) = e {
                             if e.vote_granted {
                                 votes += 1;
@@ -743,7 +743,7 @@ impl Raft {
                 .get_log(self.last_applied + 1)
                 .map(|l| l.term)
                 .unwrap_or_default();
-            info!(
+            debug!(
                 "apply log, t:{}, i:{}, peer {}, is_leader:{}, last_i:{},last_i_i:{}",
                 t,
                 self.last_applied + 1,
@@ -762,7 +762,7 @@ impl Raft {
         }
     }
 
-    fn step(&mut self) {
+    fn refresh_commit_index(&mut self) {
         if !self.state.is_leader() {
             return;
         }
@@ -887,13 +887,7 @@ impl Node {
                     if let Some(event) = event {
                         rf.handle_event(event);
                     } else {
-                        rf.step();
-                        info!(
-                            "Peer {}, is_leader:{}, last_log_index:{}",
-                            rf.me,
-                            rf.state.is_leader,
-                            rf.last_log_index()
-                        );
+                        rf.refresh_commit_index();
                     }
                     rf.try_commit();
                     Ok(())
