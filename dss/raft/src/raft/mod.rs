@@ -594,14 +594,16 @@ impl Raft {
         self.persistent_state.last_included_index = args.last_included_index;
         self.persistent_state.last_included_term = args.last_included_term;
         self.persist_all(args.data.clone());
-        self.apply_ch
-            .unbounded_send(ApplyMsg {
-                command_valid: false,
-                command: args.data,
-                command_index: args.leader_id, // command_index is meaningless here, use it for debuging
-            })
-            .unwrap();
         let last_i = args.last_included_index as usize;
+        if self.last_applied < last_i {
+            self.apply_ch
+                .unbounded_send(ApplyMsg {
+                    command_valid: false,
+                    command: args.data,
+                    command_index: args.leader_id, // command_index is meaningless here, use it for debuging
+                })
+                .unwrap();
+        }
         self.commit_index = last_i.max(self.commit_index);
         self.last_applied = last_i.max(self.last_applied);
         let _ = sender.send(reply);
@@ -633,6 +635,7 @@ impl Raft {
                             reply,
                         ));
                     } else {
+                        // TODO Delay, re-send
                         info!("{} failed to install_snapshot_to {}", me, i);
                     }
                     Ok(())
