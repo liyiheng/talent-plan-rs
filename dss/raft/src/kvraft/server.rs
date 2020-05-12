@@ -1,9 +1,6 @@
 use crate::proto::kvraftpb::*;
-use crate::raft;
-use std::collections::HashMap;
-use std::time::Duration;
-
 use crate::proto::raftpb::RaftClient;
+use crate::raft;
 use crate::raft::errors::Error;
 use crate::raft::ApplyMsg;
 use futures::future;
@@ -15,6 +12,8 @@ use futures::sync::oneshot;
 use futures::Stream;
 use futures_timer::Delay;
 use labrpc::RpcFuture;
+use std::collections::HashMap;
+use std::time::Duration;
 
 pub struct KvServer {
     pub rf: raft::Node,
@@ -351,14 +350,12 @@ impl KvServer {
     }
 }
 
-// Node communicate with KvServer through a channel,
+// Node communicate with KvServer through a channel
 #[derive(Clone)]
 pub struct Node {
     event_sender: UnboundedSender<Event>,
 }
 
-// Node communicate with KvServer through Event and
-// a channel
 enum Event {
     Shutdown,
     PutAppend(PutAppendRequest, oneshot::Sender<PutAppendReply>),

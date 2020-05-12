@@ -1,14 +1,16 @@
-use rand::Rng;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use std::time::Instant;
-
+use self::errors::*;
+use self::persister::*;
+use crate::proto::raftpb::*;
 use futures::future;
 use futures::sync::mpsc::UnboundedSender;
 use futures::sync::oneshot;
 use futures::{Future, Stream};
 use futures_timer::{Delay, Interval};
 use labrpc::{Error as RpcError, RpcFuture};
+use rand::Rng;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use std::time::Instant;
 
 #[cfg(test)]
 pub mod config;
@@ -16,10 +18,6 @@ pub mod errors;
 pub mod persister;
 #[cfg(test)]
 mod tests;
-
-use self::errors::*;
-use self::persister::*;
-use crate::proto::raftpb::*;
 
 const RPC_TIMEOUT: Duration = Duration::from_millis(50);
 const MIN_ELECTION_TIMEOUT: Duration = Duration::from_millis(150);
@@ -142,7 +140,7 @@ impl Raft {
         self.persister.save_raft_state(data);
     }
 
-    /// save persistent state and snapshot
+    /// save all the persistent state and snapshot
     fn persist_all(&mut self, snapshot: Vec<u8>) {
         let mut data = vec![];
         labcodec::encode(&self.persistent_state, &mut data).unwrap();
@@ -163,6 +161,7 @@ impl Raft {
         // Snapshot was applied by kvraft
         self.last_applied = self.last_applied.max(last_i);
         self.commit_index = self.commit_index.max(last_i);
+
         self.state = Arc::new(State {
             is_leader: false,
             term: self.persistent_state.current_term,
@@ -927,9 +926,7 @@ impl Node {
     where
         M: labcodec::Message,
     {
-        let x = self.raft.lock().unwrap().start(command);
-        info!("Start: {:?}, result:{:?}", command, x);
-        x
+        self.raft.lock().unwrap().start(command)
     }
 
     /// Create a snapshot and clear all logs in persistent_state
