@@ -321,7 +321,7 @@ impl Raft {
                 }
             }
             Event::InstallSnapshot(args, sender) => {
-                self.install_snapshot(args, sender);
+                self.handle_install_snapshot(args, sender);
             }
             Event::AppendEntriesResult(peer, index, reply) => {
                 if reply.success {
@@ -349,7 +349,7 @@ impl Raft {
         }
     }
 
-    fn handle_append_entries(&mut self, args: AppendEntriesArgs) -> AppendEntriesReply {
+    fn handle_append_entries(&mut self, mut args: AppendEntriesArgs) -> AppendEntriesReply {
         let current_term = self.state.term();
         let mut resp = AppendEntriesReply {
             term: current_term,
@@ -399,8 +399,16 @@ impl Raft {
         // but different terms), delete the existing entry and all that
         // follow it (§5.3)
         // 4. Append any new entries not already in the log
-        let start_pos = prev_i - self.persistent_state.last_included_index as usize;
-        self.persistent_state.log.drain(start_pos..);
+        if prev_i >= self.persistent_state.last_included_index as usize {
+            let start_pos = prev_i - self.persistent_state.last_included_index as usize;
+            self.persistent_state.log.drain(start_pos..);
+        } else {
+            // Handle case: earlier AppendEntries RPC comes later than InstallSnapshot RPC
+            self.persistent_state.log.clear();
+            let extra = self.persistent_state.last_included_index as usize - prev_i;
+            let tail = args.entries.len().min(extra);
+            args.entries.drain(..tail);
+        }
         self.persistent_state
             .log
             .extend(args.entries.iter().cloned());
@@ -561,7 +569,7 @@ impl Raft {
         self.peers[self.me].spawn(fut);
     }
 
-    fn install_snapshot(
+    fn handle_install_snapshot(
         &mut self,
         args: InstallSnapshotArgs,
         sender: oneshot::Sender<InstallSnapshotReply>,
@@ -635,7 +643,7 @@ impl Raft {
                             reply,
                         ));
                     } else {
-                        // TODO Delay, re-send
+                        // Resend needed?
                         info!("{} failed to install_snapshot_to {}", me, i);
                     }
                     Ok(())
