@@ -7,10 +7,12 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::io::prelude::*;
 
 /// Represents all types of RESP
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum RedisType {
-    /// Simple string and bulk string of RESP
+    /// Simple string of RESP
     Str(String),
+    /// Bulk string of RESP
+    BulkStr(String),
     /// Errors of RESP
     Error(String),
     /// Integer of RESP
@@ -26,10 +28,12 @@ impl<'de> Visitor<'de> for RedisTypeVisitor {
     fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(formatter, "invalid data")
     }
-    fn visit_str<E>(self, v: &str) ->Result<Self::Value, E> where E: serde::de::Error{
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
         let mut reader = std::io::BufReader::new(v.as_bytes());
-        from_reader(&mut reader)
-            .map_err(|e|E::custom(e.to_string()))
+        from_reader(&mut reader).map_err(|e| E::custom(e.to_string()))
     }
 }
 
@@ -47,16 +51,13 @@ impl Serialize for RedisType {
     where
         S: Serializer,
     {
-        // let s = self.to_string();
-        // serilizer.serialize_str(&s)
         match self {
+            RedisType::BulkStr(v) => {
+                let s = format!("${}\r\n{}\r\n", v.len(), v);
+                serilizer.serialize_str(&s)
+            }
             RedisType::Str(v) => {
-                let multi_line = v.contains('\n') || v.contains('\r');
-                let s = if multi_line {
-                    format!("${}\r\n{}\r\n", v.len(), v)
-                } else {
-                    format!("+{}\r\n", v)
-                };
+                let s = format!("+{}\r\n", v);
                 serilizer.serialize_str(&s)
             }
             RedisType::Error(v) => {
@@ -110,9 +111,9 @@ pub fn from_reader(reader: &mut impl BufRead) -> Result<RedisType, Error> {
             reader.read_until(b'\r', &mut v)?;
             v.pop();
             reader.read_exact(&mut one_byte)?;
-            let len: isize = String::from_utf8(v).unwrap().parse()?;
+            let len: isize = String::from_utf8_lossy(&v).parse()?;
             if len <= 0 {
-                return Ok(RedisType::Str(String::new()));
+                return Ok(RedisType::BulkStr(String::new()));
             }
             let mut data = vec![0; len as usize + 2];
             reader.read_exact(&mut data[..])?;
@@ -144,21 +145,20 @@ impl ToString for RedisType {
     fn to_string(&self) -> String {
         let mut resp = String::new();
         match self {
+            RedisType::BulkStr(s) => {
+                resp.push('$');
+                resp.push_str(&s.len().to_string());
+                resp.push('\r');
+                resp.push('\n');
+                resp.push_str(s);
+                resp.push('\r');
+                resp.push('\n');
+            }
             RedisType::Str(s) => {
-                if s.contains('\n') || s.contains('\r') {
-                    resp.push('$');
-                    resp.push_str(&s.len().to_string());
-                    resp.push('\r');
-                    resp.push('\n');
-                    resp.push_str(s);
-                    resp.push('\r');
-                    resp.push('\n');
-                } else {
-                    resp.push('+');
-                    resp.push_str(s);
-                    resp.push('\r');
-                    resp.push('\n');
-                }
+                resp.push('+');
+                resp.push_str(s);
+                resp.push('\r');
+                resp.push('\n');
             }
             RedisType::Error(e) => {
                 resp.push('-');
