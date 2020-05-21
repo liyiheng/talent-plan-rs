@@ -1,8 +1,11 @@
 use std::panic::catch_unwind;
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -73,16 +76,34 @@ impl Drop for ThreadPool {
     }
 }
 
+struct JobStatus {
+    jobs_completed: AtomicU32,
+}
+
 fn main() {
-    let pool = ThreadPool::new(8).unwrap();
-    for i in 0..80 {
+    let pool = ThreadPool::new(4).unwrap();
+    for _ in 0..10 {
         pool.spawn(move || {
-            std::thread::sleep(Duration::from_secs(1));
-            println!("{}", i);
-            if i % 2 == 0 {
-                // Panics are OK
-                panic!("Oops");
-            }
+            thread::sleep(Duration::from_millis(50));
+            // Panics are OK
+            panic!("Oops!");
         });
     }
+    let status = Arc::new(JobStatus {
+        jobs_completed: AtomicU32::new(0),
+    });
+
+    let job_cnt = 100;
+    for _ in 0..job_cnt {
+        let status_shared = status.clone();
+        pool.spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            status_shared.jobs_completed.fetch_add(1, Ordering::Release);
+        });
+    }
+    while status.jobs_completed.load(Ordering::Acquire) < job_cnt {
+        println!("waiting... ");
+        thread::sleep(Duration::from_millis(100));
+    }
+    println!("All jobs done ");
 }
