@@ -1,3 +1,5 @@
+use std::panic::catch_unwind;
+use std::panic::AssertUnwindSafe;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -10,7 +12,7 @@ struct ThreadPool {
 }
 
 enum Msg {
-    Quit,
+    Shutdown,
     Job(Box<dyn FnOnce() + Send + 'static>),
 }
 
@@ -28,16 +30,22 @@ impl ThreadPool {
                 }
                 let job = job.unwrap();
                 match job {
-                    Msg::Quit => break,
+                    Msg::Shutdown => break,
                     Msg::Job(f) => {
-                        &f();
+                        // Use catch_unwind here to keep all threads in the pool alive
+                        let wrapper = AssertUnwindSafe(f);
+                        if let Err(e) = catch_unwind(move || {
+                            wrapper();
+                        }) {
+                            println!("Error occurred:{:?}", e);
+                        }
                     }
                 };
             });
             handles.push(Some(handle));
         }
         Ok(ThreadPool {
-            handles: handles,
+            handles,
             sender: tx,
         })
     }
@@ -49,11 +57,14 @@ impl ThreadPool {
         let _ = self.sender.send(Msg::Job(Box::new(job)));
     }
 }
+
 impl Drop for ThreadPool {
     fn drop(&mut self) {
+        // Notify all threads to shutdown
         for _ in 0..self.handles.len() {
-            let _ = self.sender.send(Msg::Quit);
+            let _ = self.sender.send(Msg::Shutdown);
         }
+
         for h in self.handles.iter_mut() {
             if let Some(h) = h.take() {
                 h.join().unwrap();
@@ -69,7 +80,8 @@ fn main() {
             std::thread::sleep(Duration::from_secs(1));
             println!("{}", i);
             if i % 2 == 0 {
-                panic!("Ops");
+                // Panics are OK
+                panic!("Oops");
             }
         });
     }
