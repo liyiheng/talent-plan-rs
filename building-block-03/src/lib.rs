@@ -5,6 +5,8 @@ use serde::de::Visitor;
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::io::prelude::*;
+/// asdf
+pub mod custom_serde;
 
 /// Represents all types of RESP
 #[derive(Debug, Clone)]
@@ -46,6 +48,9 @@ impl<'de> Deserialize<'de> for RedisType {
     }
 }
 
+struct RESPSerializer {
+    output: String,
+}
 impl Serialize for RedisType {
     fn serialize<S>(&self, serilizer: S) -> Result<S::Ok, S::Error>
     where
