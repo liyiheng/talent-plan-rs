@@ -214,14 +214,11 @@ impl<'a> ser::SerializeSeq for &'a mut Serializer {
     {
         value.serialize(&mut **self)
     }
-
-    // Close the sequence.
     fn end(self) -> Result<()> {
         Ok(())
     }
 }
 
-// Same thing but for tuples.
 impl<'a> ser::SerializeTuple for &'a mut Serializer {
     type Ok = ();
     type Error = Error;
@@ -239,7 +236,6 @@ impl<'a> ser::SerializeTuple for &'a mut Serializer {
     }
 }
 
-// Same thing but for tuple structs.
 impl<'a> ser::SerializeTupleStruct for &'a mut Serializer {
     type Ok = ();
     type Error = Error;
@@ -297,8 +293,6 @@ impl<'a> ser::SerializeMap for &'a mut Serializer {
     }
 }
 
-// Structs are like maps in which the keys are constrained to be compile-time
-// constant strings.
 impl<'a> ser::SerializeStruct for &'a mut Serializer {
     type Ok = ();
     type Error = Error;
@@ -324,16 +318,15 @@ impl<'a> ser::SerializeStructVariant for &'a mut Serializer {
     where
         T: ?Sized + Serialize,
     {
-        match key {
-            "BulkStr" => {
-                self.output += "$";
-            }
-            "Str" => self.output += "+",
-            "Err" => self.output += "-",
-            "Integer" => self.output += ":",
-            "Array" => self.output += "*",
-            _ => {}
-        }
+        let first_c = match key {
+            "BulkStr" => '$',
+            "Str" => '+',
+            "Err" => '-',
+            "Integer" => ':',
+            "Array" => '*',
+            _ => '$',
+        };
+        self.output.push(first_c);
         value.serialize(&mut **self)
     }
 
@@ -353,22 +346,18 @@ mod test {
     }
     #[test]
     fn test_ser() {
-        let t = RedisType::Str("hello".to_owned());
-        check(&t);
+        let t1 = RedisType::Str("hello".to_owned());
+        check(&t1);
 
-        let t = RedisType::BulkStr("hello".to_owned());
-        check(&t);
+        let t2 = RedisType::BulkStr("hello".to_owned());
+        check(&t2);
 
-        let t = RedisType::Error("hello".to_owned());
-        check(&t);
-
-        let t = RedisType::Integer(666);
-        check(&t);
-
-        let t1 = RedisType::BulkStr("hello".to_owned());
-        let t2 = RedisType::Integer(666);
         let t3 = RedisType::Error("hello".to_owned());
-        let t4 = RedisType::Str("hello".to_owned());
+        check(&t3);
+
+        let t4 = RedisType::Integer(666);
+        check(&t4);
+
         let t = RedisType::Array(vec![t1, t2, t3, t4]);
         check(&t);
     }

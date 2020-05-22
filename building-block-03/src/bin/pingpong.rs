@@ -1,5 +1,6 @@
+use bb3::custom_serde::to_resp;
+use bb3::RedisType;
 use building_block_03 as bb3;
-use building_block_03::RedisType;
 use std::io::prelude::*;
 use std::io::BufReader;
 use std::net::TcpListener;
@@ -29,7 +30,8 @@ fn handle_stream(mut s: TcpStream) {
             gen_resp(r)
         }
     };
-    s.write_all(msg.to_string().as_bytes()).unwrap();
+    // s.write_all(msg.to_string().as_bytes()).unwrap();
+    s.write_all(to_resp(&msg).unwrap().as_bytes()).unwrap();
 }
 
 fn gen_resp(r: RedisType) -> RedisType {
