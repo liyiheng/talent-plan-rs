@@ -1,3 +1,5 @@
+use crate::RedisType;
+use ser::SerializeSeq;
 use serde::de;
 use serde::{ser, Serialize};
 
@@ -7,6 +9,39 @@ use std::fmt::Display;
 /// Error wraps failure::Error, implements ser::Error and de::Error
 #[derive(Debug)]
 pub struct Error(FailureError);
+
+impl Serialize for RedisType {
+    fn serialize<S>(&self, serilizer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            RedisType::BulkStr(v) => {
+                let s = format!("${}\r\n{}\r\n", v.len(), v);
+                serilizer.serialize_str(&s)
+            }
+            RedisType::Str(v) => {
+                let s = format!("+{}\r\n", v);
+                serilizer.serialize_str(&s)
+            }
+            RedisType::Error(v) => {
+                let s = format!("-{}\r\n", v);
+                serilizer.serialize_str(&s)
+            }
+            RedisType::Integer(v) => {
+                let s = format!(":{}\r\n", v);
+                serilizer.serialize_str(&s)
+            }
+            RedisType::Array(v) => {
+                let mut seq = serilizer.serialize_seq(Some(v.len()))?;
+                for ele in v.iter() {
+                    seq.serialize_element(ele)?;
+                }
+                seq.end()
+            }
+        }
+    }
+}
 
 /// Result is just an alias
 pub type Result<T> = std::result::Result<T, Error>;
@@ -102,7 +137,6 @@ impl<'a> ser::Serializer for &'a mut Serializer {
         Ok(())
     }
     fn serialize_bytes(self, v: &[u8]) -> Result<()> {
-        use serde::ser::SerializeSeq;
         let mut seq = self.serialize_seq(Some(v.len()))?;
         for byte in v {
             seq.serialize_element(byte)?;

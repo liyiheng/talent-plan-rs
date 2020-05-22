@@ -51,38 +51,6 @@ impl<'de> Deserialize<'de> for RedisType {
 struct RESPSerializer {
     output: String,
 }
-impl Serialize for RedisType {
-    fn serialize<S>(&self, serilizer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self {
-            RedisType::BulkStr(v) => {
-                let s = format!("${}\r\n{}\r\n", v.len(), v);
-                serilizer.serialize_str(&s)
-            }
-            RedisType::Str(v) => {
-                let s = format!("+{}\r\n", v);
-                serilizer.serialize_str(&s)
-            }
-            RedisType::Error(v) => {
-                let s = format!("-{}\r\n", v);
-                serilizer.serialize_str(&s)
-            }
-            RedisType::Integer(v) => {
-                let s = format!(":{}\r\n", v);
-                serilizer.serialize_str(&s)
-            }
-            RedisType::Array(v) => {
-                let mut seq = serilizer.serialize_seq(Some(v.len()))?;
-                for ele in v.iter() {
-                    seq.serialize_element(ele)?;
-                }
-                seq.end()
-            }
-        }
-    }
-}
 
 /// Decode from reader
 pub fn from_reader(reader: &mut impl BufRead) -> Result<RedisType, Error> {
