@@ -20,18 +20,22 @@ fn main() {
 
 fn handle_stream(mut s: TcpStream) {
     let mut reader = BufReader::new(&mut s);
-    let msg = match bb3::from_reader(&mut reader) {
-        Err(e) => {
-            println!("{:?}", e);
-            RedisType::Str(format!("{}", e))
+    loop {
+        let msg = match bb3::from_reader(&mut reader) {
+            Err(e) => {
+                println!("{:?}", e);
+                RedisType::Str(format!("{}", e))
+            }
+            Ok(r) => {
+                println!("{:?}", r);
+                gen_resp(r)
+            }
+        };
+        let resp = to_resp(&msg).unwrap();
+        if reader.get_mut().write_all(resp.as_bytes()).is_err() {
+            break;
         }
-        Ok(r) => {
-            println!("{:?}", r);
-            gen_resp(r)
-        }
-    };
-    // s.write_all(msg.to_string().as_bytes()).unwrap();
-    s.write_all(to_resp(&msg).unwrap().as_bytes()).unwrap();
+    }
 }
 
 fn gen_resp(r: RedisType) -> RedisType {
