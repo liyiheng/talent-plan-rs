@@ -1,17 +1,33 @@
 use crate::RedisType;
+use failure::Error as FailureError;
 use ser::SerializeSeq;
 use serde::de;
-use serde::{ser, Serialize};
-
-use failure::Error as FailureError;
+use serde::ser;
+use serde::Serialize;
 use std::fmt::Display;
+use std::result::Result as StdResult;
 
 /// Error wraps failure::Error, implements ser::Error and de::Error
 #[derive(Debug)]
-pub struct Error(FailureError);
+pub struct Error(pub FailureError);
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Error(failure::format_err!("{}", e.to_string()))
+    }
+}
+impl From<std::num::ParseIntError> for Error {
+    fn from(e: std::num::ParseIntError) -> Self {
+        Error(failure::format_err!("{}", e.to_string()))
+    }
+}
+
+/// Serializer for RESP
+pub struct Serializer {
+    output: String,
+}
 
 impl Serialize for RedisType {
-    fn serialize<S>(&self, serilizer: S) -> std::result::Result<S::Ok, S::Error>
+    fn serialize<S>(&self, serilizer: S) -> StdResult<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
@@ -28,10 +44,7 @@ impl Serialize for RedisType {
                 let s = format!("-{}\r\n", v);
                 serilizer.serialize_str(&s)
             }
-            RedisType::Integer(v) => {
-                let s = format!(":{}\r\n", v);
-                serilizer.serialize_str(&s)
-            }
+            RedisType::Integer(v) => serilizer.serialize_i64(*v),
             RedisType::Array(v) => {
                 let mut seq = serilizer.serialize_seq(Some(v.len()))?;
                 for ele in v.iter() {
@@ -64,11 +77,6 @@ impl de::Error for Error {
     }
 }
 
-/// Serializer for RESP
-pub struct Serializer {
-    output: String,
-}
-
 /// Serialize RedisType to RESP string
 pub fn to_resp<T>(value: &T) -> Result<String>
 where
@@ -93,8 +101,8 @@ impl<'a> ser::Serializer for &'a mut Serializer {
     type SerializeStructVariant = Self;
 
     fn serialize_bool(self, v: bool) -> Result<()> {
-        self.output += if v { "true" } else { "false" };
-        Ok(())
+        let v = if v { "true" } else { "false" };
+        self.serialize_str(v)
     }
     fn serialize_i8(self, v: i8) -> Result<()> {
         self.serialize_i64(i64::from(v))
@@ -106,7 +114,7 @@ impl<'a> ser::Serializer for &'a mut Serializer {
         self.serialize_i64(i64::from(v))
     }
     fn serialize_i64(self, v: i64) -> Result<()> {
-        self.output += &v.to_string();
+        self.output += &format!(":{}\r\n", v.to_string());
         Ok(())
     }
     fn serialize_u8(self, v: u8) -> Result<()> {
@@ -372,7 +380,7 @@ impl<'a> ser::SerializeStructVariant for &'a mut Serializer {
 
 #[cfg(test)]
 mod test {
-    use crate::custom_serde::to_resp;
+    use crate::custom_ser::to_resp;
     use crate::RedisType;
 
     fn check(t: &RedisType) {

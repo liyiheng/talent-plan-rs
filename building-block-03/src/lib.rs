@@ -1,12 +1,16 @@
 //! A lib for RESP encoding and decoding
 #![deny(missing_docs)]
 use failure::{self, Error};
-use serde::de::Visitor;
-use serde::ser::SerializeSeq;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::io::prelude::*;
-/// asdf
-pub mod custom_serde;
+
+/// Implemented Deserialize and Visitor, but not the Deserializer.
+///
+/// It seems a full implementatiion needs hundreds of lines of code,
+/// far longer than hand-written version, not sure if I got point of the exercise.
+/// I removed the buggy Deserializer implementatiion finally
+pub mod custom_de;
+/// Serialize RedisType with serde by implementing trait Serialize and Serializer
+pub mod custom_ser;
 
 /// Represents all types of RESP
 #[derive(Debug, Clone)]
@@ -21,35 +25,6 @@ pub enum RedisType {
     Integer(i64),
     /// Array of RESP
     Array(Vec<RedisType>),
-}
-
-struct RedisTypeVisitor;
-
-impl<'de> Visitor<'de> for RedisTypeVisitor {
-    type Value = RedisType;
-    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(formatter, "invalid data")
-    }
-    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        let mut reader = std::io::BufReader::new(v.as_bytes());
-        from_reader(&mut reader).map_err(|e| E::custom(e.to_string()))
-    }
-}
-
-impl<'de> Deserialize<'de> for RedisType {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_str(RedisTypeVisitor)
-    }
-}
-
-struct RESPSerializer {
-    output: String,
 }
 
 /// Decode from reader
